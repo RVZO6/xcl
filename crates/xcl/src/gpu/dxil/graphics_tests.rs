@@ -1236,3 +1236,98 @@ fn ps_static_resources_match_dxc() {
     assert_eq!(part(&c, b"SFI0"), part(DXC_PS_RESOURCES, b"SFI0"));
     assert_valid(&c);
 }
+
+fn rdna_prog(ops: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+    let mut code = Vec::new();
+    for &(name, enc, fields) in ops {
+        code.extend(crate::gpu::rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+    }
+    code.extend(crate::gpu::rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    code
+}
+
+fn rdna_sig(name: &str, sv: u32, mask: u8) -> crate::gpu::dxbc::SigElement {
+    crate::gpu::dxbc::SigElement { name: name.into(), index: 0, system_value: sv, component_type: 3, register: 0, mask, rw_mask: mask, stream: 0 }
+}
+
+fn count_calls(dis: &str, needle: &str) -> usize {
+    dis.lines().filter(|l| l.contains("call ") && l.contains(needle)).count()
+}
+
+#[test]
+fn ps_dpp16_and_swizzle_quad_perms_use_quad_ops_without_wave_ops() {
+    use crate::gpu::dxil::kernel::{translate_pixel, KernelOptions};
+    use crate::gpu::recomp::PsInterface;
+    const V: u64 = 256;
+    let code = rdna_prog(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 4), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x163), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 7), ("SRC0", 0xFA), ("VSRC0", 1), ("DPP_CTRL", 0xA0), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 10), ("SRC0", 0xFA), ("VSRC0", 1), ("DPP_CTRL", 0xE4), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 8), ("ADDR", 2), ("OFFSET0", 0x55), ("OFFSET1", 0x80)]),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 9), ("ADDR", 3), ("OFFSET0", 0x1F), ("OFFSET1", 0x08)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 4), ("VSRC1", 8)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 5), ("SRC0", V + 5), ("VSRC1", 9)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 7), ("SRC0", V + 7), ("VSRC1", 10)]),
+        ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1), ("VM", 1)]),
+    ]);
+    let psi = PsInterface { inputs: vec![rdna_sig("SV_Position", 1, 0xF)], outputs: vec![rdna_sig("SV_Target", 64, 0xF)], input_ena: 0xF00, attrs: None };
+    for wave64 in [true, false] {
+        let k = translate_pixel(&code, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, &psi).expect("translate PS");
+        assert_valid(&k.dxil);
+        let dis = validate::disassemble(&k.dxil).expect("disassemble PS");
+        assert_eq!(count_calls(&dis, "@dx.op.waveReadLaneAt."), 0, "wave64={wave64}: unexpected waveReadLaneAt:\n{dis}");
+        assert_eq!(count_calls(&dis, "@dx.op.quadOp."), 4, "wave64={wave64}: expected 4 quadOp calls:\n{dis}");
+        assert_eq!(count_calls(&dis, "@dx.op.quadReadLaneAt."), 3, "wave64={wave64}: expected 3 memoized quadReadLaneAt calls:\n{dis}");
+        assert!(dis.contains(", i8 0)") && dis.contains(", i8 1)") && dis.contains(", i8 2)"), "wave64={wave64}: missing ReadAcrossX/Y/Diag:\n{dis}");
+    }
+}
+
+#[test]
+fn ps_readfirstlane_and_const_readlane_use_single_wave_read() {
+    use crate::gpu::dxil::kernel::{translate_pixel, KernelOptions};
+    use crate::gpu::recomp::PsInterface;
+    const V: u64 = 256;
+    let psi = PsInterface { inputs: vec![rdna_sig("SV_Position", 1, 0xF)], outputs: vec![rdna_sig("SV_Target", 64, 0xF)], input_ena: 0x100, attrs: None };
+    let exp = ("EXP", "ENC_EXP", &[("TGT", 0), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 4), ("VSRC2", 4), ("VSRC3", 4), ("DONE", 1), ("VM", 1)][..]);
+    let mov = ("V_MOV_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", 4)][..]);
+    let rfl = rdna_prog(&[("V_READFIRSTLANE_B32", "ENC_VOP1", &[("VDST", 4), ("SRC0", V)]), mov, exp]);
+    let rl5 = rdna_prog(&[("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 128 + 5)]), mov, exp]);
+    let rl37 = rdna_prog(&[("V_READLANE_B32", "ENC_VOP3", &[("VDST", 4), ("SRC0", V), ("SRC1", 128 + 37)]), mov, exp]);
+    let cases = [("readfirstlane", &rfl, 4, true), ("readfirstlane", &rfl, 4, false), ("const_readlane_5", &rl5, 1, true), ("const_readlane_5", &rl5, 1, false), ("const_readlane_37", &rl37, 1, true)];
+    for (label, code, want_quad, wave64) in cases {
+        let k = translate_pixel(code, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, &psi).expect(label);
+        assert_valid(&k.dxil);
+        let dis = validate::disassemble(&k.dxil).expect(label);
+        assert_eq!(count_calls(&dis, "@dx.op.waveReadLaneAt."), 1, "{label} wave64={wave64}: expected 1 waveReadLaneAt:\n{dis}");
+        assert_eq!(count_calls(&dis, "@dx.op.quadReadLaneAt."), want_quad, "{label} wave64={wave64}: expected {want_quad} quadReadLaneAt:\n{dis}");
+        assert!(!dis.contains("@dx.op.binary.i32(i32 40,"), "{label} wave64={wave64}: old 4-word umin ballot select remains:\n{dis}");
+        assert!(!dis.lines().any(|l| l.contains("extractvalue %dx.types.fouri32 ") && (l.contains(", 2") || l.contains(", 3"))), "{label} wave64={wave64}: dead ballot word 2/3 extract remains:\n{dis}");
+    }
+}
+
+#[test]
+fn vs_dpp16_never_emits_quad_ops() {
+    use crate::gpu::dxil::kernel::{translate_vertex, KernelOptions};
+    use crate::gpu::recomp::VsInterface;
+    const V: u64 = 256;
+    let code = rdna_prog(&[
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 4), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0xB1), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 5), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x4E), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 0)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 6), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x55), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 7), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", 0x163), ("ROW_MASK", 0xF), ("BANK_MASK", 0xF), ("FI", 1)]),
+        ("DS_SWIZZLE_B32", "ENC_DS", &[("VDST", 8), ("ADDR", 3), ("OFFSET0", 0xB1), ("OFFSET1", 0x80)]),
+        ("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 4), ("SRC0", V + 4), ("VSRC1", 8)]),
+        ("EXP", "ENC_EXP", &[("TGT", 12), ("EN", 0xF), ("VSRC0", 4), ("VSRC1", 5), ("VSRC2", 6), ("VSRC3", 7), ("DONE", 1)]),
+    ]);
+    let vsi = VsInterface { inputs: vec![], outputs: vec![rdna_sig("SV_Position", 1, 0xF)], attr_base: 4, params: None };
+    for wave64 in [true, false] {
+        let k = translate_vertex(&code, KernelOptions { wave64, split: false, mem_windows: 1, sampler_base: 0 }, &vsi).expect("translate VS");
+        assert_valid(&k.dxil);
+        let dis = validate::disassemble(&k.dxil).expect("disassemble VS");
+        assert_eq!(count_calls(&dis, "@dx.op.quadOp."), 0, "wave64={wave64}: VS must never emit quadOp:\n{dis}");
+        assert_eq!(count_calls(&dis, "@dx.op.quadReadLaneAt."), 0, "wave64={wave64}: VS must never emit quadReadLaneAt:\n{dis}");
+        assert_eq!(count_calls(&dis, "@dx.op.waveReadLaneAt."), 5, "wave64={wave64}: expected 5 waveReadLaneAt in VS:\n{dis}");
+    }
+}

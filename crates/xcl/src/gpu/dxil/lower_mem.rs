@@ -107,6 +107,23 @@ fn ds_d16(name: &str) -> Option<(u32, bool, bool, u32)> {
     })
 }
 
+/// Quad-local permutation `[p0, p1, p2, p3]` for `ds_swizzle_b32` quad mode (`0x8000..0xC000`)
+/// and bit mode (`off16 < 0x8000`) whose high 3 lane bits (`0x1C`) stay fixed.
+fn swizzle_quad_perm(off16: u32) -> Option<[u32; 4]> {
+    if (0x8000..0xC000).contains(&off16) {
+        Some([0, 2, 4, 6].map(|sh| (off16 >> sh) & 3))
+    } else if off16 < 0x8000 {
+        let (and, or, xor) = (off16 & 0x1F, (off16 >> 5) & 0x1F, (off16 >> 10) & 0x1F);
+        if (and & 0x1C) == 0x1C && (or & 0x1C) == 0 && (xor & 0x1C) == 0 {
+            Some([0, 1, 2, 3].map(|q| ((q & (and & 3)) | (or & 3)) ^ (xor & 3)))
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
 /// Where a 32-bit atomic works.
 #[derive(Clone, Copy)]
 enum At {
@@ -2068,7 +2085,11 @@ impl Lw {
                 let a = self.vreg(f("ADDR"));
                 let l = self.swizzle_lane(off16 as u64);
                 let (el, eh) = self.exec_mask();
-                let v = self.read_lane_half(a, l);
+                let v = if let Some(p) = swizzle_quad_perm(off16).filter(|_| self.supports_quad_ops()) {
+                    self.read_lane_quad(a, p)
+                } else {
+                    self.read_lane_half(a, l)
+                };
                 let on = self.lanebit_at(el, eh, l);
                 let z = self.c(0);
                 let t = self.sel(on, v, z);
