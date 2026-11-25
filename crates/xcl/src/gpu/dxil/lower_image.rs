@@ -805,25 +805,15 @@ impl Lw {
         }
         match base {
             "load" | "load_mip" => {
-                let tmps = [self.tmp_var(), self.tmp_var(), self.tmp_var(), self.tmp_var()];
+                let loaded = self.with_typed_tex_switch(run, tw0, lkind, false, 4, cls, comps.len(), &mut |lw, tex| {
+                    let r = lw.s.texture_load(tex, Some(mip), &ic, &[]);
+                    comps.iter().map(|&c| lw.bits(r[c as usize])).collect()
+                });
                 let z = self.c(0);
-                for &t in &tmps {
-                    self.wr(t, z);
+                let mut r = [z; 4];
+                for (&c, v) in comps.iter().zip(loaded) {
+                    r[c as usize] = v;
                 }
-                for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
-                    let is = self.cmpc(Pred::Eq, cls, cv);
-                    let c = self.land(run, is);
-                    self.guarded(c, &mut |lw| {
-                        let tex: Texture = lw.s.heap_texture(tw0, lkind, false, ct, 4, true);
-                        let r = lw.s.texture_load(tex, Some(mip), &ic, &[]);
-                        for k in 0..4 {
-                            let b = lw.bits(r[k]);
-                            lw.wr(tmps[k], b);
-                        }
-                        Ok(())
-                    })?;
-                }
-                let r: Vec<Value> = tmps.iter().map(|&t| self.rd(t)).collect();
                 let vals: Vec<Value> = if d16 {
                     // float: f32tof16, else the low 16 bits
                     comps
@@ -861,16 +851,11 @@ impl Lw {
                     }
                 }
                 let ui = self.addc(tw0, 1);
-                for (cv, ct) in [(1u32, CompType::U32), (2, CompType::I32), (0, CompType::F32)] {
-                    let is = self.cmpc(Pred::Eq, cls, cv);
-                    let c = self.land(run, is);
-                    self.guarded(c, &mut |lw| {
-                        let tex = lw.s.heap_texture(ui, lkind, true, ct, 4, true);
-                        let v4 = if ct == CompType::F32 { vals.map(|v| lw.f(v)) } else { vals };
-                        lw.s.texture_store(tex, &ic, v4);
-                        Ok(())
-                    })?;
-                }
+                self.with_typed_tex_switch(run, ui, lkind, true, 4, cls, 0, &mut |lw, tex| {
+                    let v4 = if tex.comp == CompType::F32 { vals.map(|v| lw.f(v)) } else { vals };
+                    lw.s.texture_store(tex, &ic, v4);
+                    Vec::new()
+                });
                 Ok(())
             }
             _ if base.starts_with("atomic_") => {
@@ -1090,6 +1075,119 @@ impl Lw {
         self.selc(t4, 1, r)
     }
 
+    /// Runs `f` once inside a single `run` guard with one `createHandleFromHeap`,
+    /// dispatching `cls` (`1` uint, `2` sint, default `0` float) via one `switch`
+    /// and per-arm `annotate_texture`. Returns `n_out` direct `phi i32` values (`0` when `!run`).
+    #[allow(clippy::too_many_arguments)]
+    fn with_typed_tex_switch(
+        &mut self,
+        run: Value,
+        idx: Value,
+        kind: TexKind,
+        uav: bool,
+        ncomp: u32,
+        cls: Value,
+        n_out: usize,
+        f: &mut dyn FnMut(&mut Lw, Texture) -> Vec<Value>,
+    ) -> Vec<Value> {
+        let z = self.c(0);
+        let run_const = self.s.m.const_u64(run);
+        if run_const == Some(0) {
+            return vec![z; n_out];
+        }
+        let fixed_ct = self.s.m.const_u64(cls).map(|c| match c {
+            1 => CompType::U32,
+            2 => CompType::I32,
+            _ => CompType::F32,
+        });
+        if let Some(ct) = fixed_ct {
+            if run_const == Some(1) {
+                let h = self.s.handle_from_heap(idx, false, true);
+                let tex = self.s.annotate_texture(h, kind, uav, ct, ncomp);
+                let vals = f(self, tex);
+                debug_assert_eq!(vals.len(), n_out);
+                return vals;
+            }
+            let from = self.cur();
+            let body = self.block(None);
+            let join = self.block(None);
+            self.cond_br(run, body, join);
+            self.seal(body);
+            self.s.m.set_block(body);
+            #[cfg(debug_assertions)]
+            self.ssa.begin_log();
+            let h = self.s.handle_from_heap(idx, false, true);
+            let tex = self.s.annotate_texture(h, kind, uav, ct, ncomp);
+            let vals = f(self, tex);
+            #[cfg(debug_assertions)]
+            debug_assert!(self.ssa.end_log().is_empty(), "with_typed_tex_switch closure wrote SSA var");
+            debug_assert_eq!(vals.len(), n_out);
+            let end = self.cur();
+            self.s.m.br(join);
+            self.ssa.seal_region_join(join, from, from, Vec::new());
+            self.s.m.set_block(join);
+            let i32_ty = self.s.m.i32();
+            return (0..n_out)
+                .map(|j| {
+                    let phi = self.s.m.phi(i32_ty);
+                    self.s.m.add_incoming(phi, z, from);
+                    self.s.m.add_incoming(phi, vals[j], end);
+                    phi
+                })
+                .collect();
+        }
+        let from = self.cur();
+        let join = self.block(None);
+        let skip_pred = if run_const == Some(1) {
+            None
+        } else {
+            let body = self.block(None);
+            self.cond_br(run, body, join);
+            self.seal(body);
+            self.s.m.set_block(body);
+            Some(from)
+        };
+        let sw_from = self.cur();
+        let h = self.s.handle_from_heap(idx, false, true);
+        let arms = [self.block(None), self.block(None), self.block(None)];
+        let cases = [(self.c(1), arms[0]), (self.c(2), arms[1])];
+        self.s.m.switch(cls, arms[2], &cases);
+        for &arm in &arms {
+            self.edge(sw_from, arm);
+            self.seal(arm);
+        }
+        let mut arm_vals: [Vec<Value>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut arm_ends = [join; 3];
+        for (k, &ct) in [CompType::U32, CompType::I32, CompType::F32].iter().enumerate() {
+            self.s.m.set_block(arms[k]);
+            #[cfg(debug_assertions)]
+            self.ssa.begin_log();
+            let tex = self.s.annotate_texture(h, kind, uav, ct, ncomp);
+            let vals = f(self, tex);
+            #[cfg(debug_assertions)]
+            debug_assert!(self.ssa.end_log().is_empty(), "with_typed_tex_switch closure wrote SSA var");
+            debug_assert_eq!(vals.len(), n_out);
+            arm_ends[k] = self.cur();
+            arm_vals[k] = vals;
+            self.s.m.br(join);
+        }
+        self.ssa.seal_region_join(join, from, from, Vec::new());
+        self.s.m.set_block(join);
+        let i32_ty = self.s.m.i32();
+        (0..n_out)
+            .map(|j| {
+                let phi = self.s.m.phi(i32_ty);
+                if let Some(p) = skip_pred {
+                    self.s.m.add_incoming(phi, z, p);
+                }
+                for k in 0..3 {
+                    self.s.m.add_incoming(phi, arm_vals[k][j], arm_ends[k]);
+                }
+                phi
+            })
+            .collect()
+    }
+
     /// Writes result components to VDATA (D16: two halves per VGPR) in active lanes.
     fn image_result(&mut self, vdata: u64, vals: &[Value], d16: bool, act: Value) -> LResult<()> {
         let mut out = Vec::new();
@@ -1173,5 +1271,37 @@ mod heap_bounds_tests {
         let hlsl = recomp::translate(&code, &recomp::Options { mode: recomp::Mode::Pixel(ps), ..Default::default() }).expect("hlsl ps translate");
         assert!(hlsl.complete(), "hlsl ps unsupported: {:?}", hlsl.unsupported);
         assert!(hlsl.hlsl.contains("select(") && hlsl.hlsl.contains("2097151u"), "expected convergent clamp in PS HLSL");
+    }
+
+    #[test]
+    fn image_load_single_channel_uses_one_heap_handle_switch_and_one_phi() {
+        let opts = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        for (op, dmask, expected_phis) in [("IMAGE_LOAD", 0x1u64, 1usize), ("IMAGE_LOAD_MIP", 0x5, 2), ("IMAGE_LOAD", 0xF, 4)] {
+            let code = mimg_prog(&[(op, &[("VDATA", 14), ("VADDR", 2), ("SRSRC", 4), ("DMASK", dmask), ("DIM", 1), ("UNORM", 1)])]);
+            let dxil = kernel::translate(&code, opts).unwrap_or_else(|e| panic!("translate {op} dmask={dmask:#x}: {e}"));
+            validate::validate(&dxil).unwrap_or_else(|e| panic!("validate {op} dmask={dmask:#x}: {e}"));
+            let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+            let heap_calls = dis.lines().filter(|l| l.contains("call ") && l.contains("@dx.op.createHandleFromHeap")).count();
+            let phis = dis.lines().filter(|l| l.contains(" = phi ")).count();
+            assert_eq!(heap_calls, 1, "{op} dmask={dmask:#x}: expected 1 createHandleFromHeap call:\n{dis}");
+            assert!(dis.contains("switch i32 "), "{op} dmask={dmask:#x}: expected switch(cls):\n{dis}");
+            assert_eq!(phis, expected_phis, "{op} dmask={dmask:#x}: expected {expected_phis} phi(s):\n{dis}");
+        }
+    }
+
+    #[test]
+    fn image_store_uses_one_heap_handle_and_switch() {
+        let opts = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        for dmask in [0x1u64, 0xF] {
+            let code = mimg_prog(&[("IMAGE_STORE", &[("VDATA", 6), ("VADDR", 2), ("SRSRC", 8), ("DMASK", dmask), ("DIM", 1), ("UNORM", 1)])]);
+            let dxil = kernel::translate(&code, opts).unwrap_or_else(|e| panic!("translate IMAGE_STORE dmask={dmask:#x}: {e}"));
+            validate::validate(&dxil).unwrap_or_else(|e| panic!("validate IMAGE_STORE dmask={dmask:#x}: {e}"));
+            let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+            let heap_calls = dis.lines().filter(|l| l.contains("call ") && l.contains("@dx.op.createHandleFromHeap")).count();
+            let phis = dis.lines().filter(|l| l.contains(" = phi ")).count();
+            assert_eq!(heap_calls, 1, "IMAGE_STORE dmask={dmask:#x}: expected 1 createHandleFromHeap call:\n{dis}");
+            assert!(dis.contains("switch i32 "), "IMAGE_STORE dmask={dmask:#x}: expected switch(cls):\n{dis}");
+            assert_eq!(phis, 0, "IMAGE_STORE dmask={dmask:#x}: expected 0 phis:\n{dis}");
+        }
     }
 }
