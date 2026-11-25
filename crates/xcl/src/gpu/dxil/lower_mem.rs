@@ -417,43 +417,111 @@ impl Lw {
         let w = self.with_mem_i32s(guard, 1, &mut |lw, m| lw.s.raw_load(m, b, 0x1))[0];
         self.bin(BinOp::LShr, w, s)
     }
+    /// Runs `on_t` (when `cond` holds) or `on_f` (otherwise) in a single `if/else`
+    /// diamond without SSA variable writes, merging an optional SSA value via `phi`.
+    fn if_else_opt<F, G>(&mut self, cond: Value, on_t: F, on_f: G) -> LResult<Option<Value>>
+    where
+        F: FnOnce(&mut Lw) -> LResult<Option<Value>>,
+        G: FnOnce(&mut Lw) -> LResult<Option<Value>>,
+    {
+        match self.s.m.const_u64(cond) {
+            Some(1) => return on_t(self),
+            Some(0) => return on_f(self),
+            _ => {}
+        }
+        let from = self.cur();
+        let (t_bb, f_bb, join) = (self.block(None), self.block(None), self.block(None));
+        self.cond_br(cond, t_bb, f_bb);
+        self.seal(t_bb);
+        self.seal(f_bb);
+        self.s.m.set_block(t_bb);
+        #[cfg(debug_assertions)]
+        self.ssa.begin_log();
+        let tv = on_t(self);
+        #[cfg(debug_assertions)]
+        debug_assert!(self.ssa.end_log().is_empty(), "if_else_opt wrote SSA var");
+        let tv = tv?;
+        let t_end = self.cur();
+        self.s.m.br(join);
+        self.s.m.set_block(f_bb);
+        #[cfg(debug_assertions)]
+        self.ssa.begin_log();
+        let fv = on_f(self);
+        #[cfg(debug_assertions)]
+        debug_assert!(self.ssa.end_log().is_empty(), "if_else_opt wrote SSA var");
+        let fv = fv?;
+        let f_end = self.cur();
+        self.s.m.br(join);
+        self.ssa.seal_region_join(join, from, from, Vec::new());
+        self.s.m.set_block(join);
+        let (Some(tv), Some(fv)) = (tv, fv) else { return Ok(None) };
+        let ty = self.s.m.type_of(tv);
+        let phi = self.s.m.phi(ty);
+        self.s.m.add_incoming(phi, tv, t_end);
+        self.s.m.add_incoming(phi, fv, f_end);
+        Ok(Some(phi))
+    }
+
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
-    fn st_part(&mut self, b: Value, m: Value, v: Value) {
+    fn st_part(&mut self, guard: Option<Value>, b: Value, m: Value, v: Value) {
+        if guard.and_then(|g| self.s.m.const_u64(g)) == Some(0) {
+            return;
+        }
         let nm = self.not(m);
         let vm = self.and(v, m);
-        self.with_mem_void(None, &mut |lw, mem| {
+        self.with_mem_void(guard, &mut |lw, mem| {
             lw.s.raw_atomic(mem, AtomicOp::And, b, nm);
             lw.s.raw_atomic(mem, AtomicOp::Or, b, vm);
         });
     }
     /// `st_bytes`: store the low `n` bytes of `r` at byte address `a` (n ≤ 16; partial
     /// dwords through atomics so neighbours stay intact).
-    fn st_bytes(&mut self, a: Value, r: [Value; 4], n: Value) -> LResult<()> {
+    fn st_bytes(&mut self, mut guard: Option<Value>, a: Value, r: [Value; 4], n: Value) -> LResult<()> {
+        match guard.and_then(|g| self.s.m.const_u64(g)) {
+            Some(0) => return Ok(()),
+            Some(1) => guard = None,
+            _ => {}
+        }
+        if self.s.m.const_u64(n) == Some(0) {
+            return Ok(());
+        }
         let s = self.andc(a, 3);
         let s = self.shlc(s, 3);
         let b = self.andc(a, !3);
-        let sz = self.cmpc(Pred::Eq, s, 0);
+        if self.s.m.const_u64(n) == Some(1) {
+            let m = self.c(0xFF);
+            let ms = self.bin(BinOp::Shl, m, s);
+            let vs = self.bin(BinOp::Shl, r[0], s);
+            self.st_part(guard, b, ms, vs);
+            return Ok(());
+        }
         let n3 = self.andc(n, 3);
         let nz3 = self.cmpc(Pred::Eq, n3, 0);
-        let whole = self.land(sz, nz3);
-        self.guarded(whole, &mut |lw| {
+        let whole = if self.s.m.const_u64(nz3) == Some(0) { nz3 } else { let sz = self.cmpc(Pred::Eq, s, 0); self.land(sz, nz3) };
+        if self.s.m.const_u64(whole) == Some(1) {
+            if let Some(k @ (4 | 8 | 12 | 16)) = self.s.m.const_u64(n) {
+                self.mem_st_n(guard, b, &r[..(k as usize / 4)]);
+                return Ok(());
+            }
+        }
+        if let Some(g) = guard {
+            return self.guarded(g, &mut |lw| lw.st_bytes_body(s, b, whole, r, n));
+        }
+        self.st_bytes_body(s, b, whole, r, n)
+    }
+    fn st_bytes_body(&mut self, s: Value, b: Value, whole: Value, r: [Value; 4], n: Value) -> LResult<()> {
+        self.if_else_opt(whole, |lw| {
             if let Some(k @ (4 | 8 | 12 | 16)) = lw.s.m.const_u64(n) {
                 lw.mem_st_n(None, b, &r[..(k as usize / 4)]);
-                return Ok(());
+                return Ok(None);
             }
             for k in 0..4u32 {
                 let has = lw.cmpc(Pred::UGt, n, k * 4);
                 let at = lw.addc(b, 4 * k);
-                let v = r[k as usize];
-                lw.guarded(has, &mut |lw| {
-                    lw.mem_st(at, v);
-                    Ok(())
-                })?;
+                lw.mem_st_n(Some(has), at, &[r[k as usize]]);
             }
-            Ok(())
-        })?;
-        let part = self.lnot(whole);
-        self.guarded(part, &mut |lw| {
+            Ok(None)
+        }, |lw| {
             // dword k of `r` holds bytes 4k..min(4k + 4, n); each lands at b + 4k with shift s
             // and spills into the next dword when s + its bit width passes 32
             let one = lw.c(1);
@@ -478,24 +546,24 @@ impl Lw {
                     let at = lw.addc(b, 4 * k);
                     let ms = lw.bin(BinOp::Shl, m, s);
                     let vs = lw.bin(BinOp::Shl, rk, s);
-                    lw.st_part(at, ms, vs);
+                    lw.st_part(None, at, ms, vs);
                     if lw.s.m.const_u64(chunk) != Some(1) {
                         let top = lw.add(s, c8);
                         let over = lw.cmpc(Pred::UGt, top, 32);
                         let spill = lw.land(snz, over);
-                        lw.guarded(spill, &mut |lw| {
+                        if lw.s.m.const_u64(spill) != Some(0) {
                             let at4 = lw.addc(at, 4);
                             let m2 = lw.bin(BinOp::LShr, m, inv);
                             let v2 = lw.bin(BinOp::LShr, rk, inv);
-                            lw.st_part(at4, m2, v2);
-                            Ok(())
-                        })?;
+                            lw.st_part(Some(spill), at4, m2, v2);
+                        }
                     }
                     Ok(())
                 })?;
             }
-            Ok(())
-        })
+            Ok(None)
+        })?;
+        Ok(())
     }
 
     // ------------------------------------------------------------ formats
@@ -1204,7 +1272,7 @@ impl Lw {
                 let c = self.land(act, ok);
                 let z = self.c(0);
                 let nv = self.c(n);
-                return self.guarded(c, &mut |lw| lw.st_bytes(a, [data, z, z, z], nv));
+                return self.st_bytes(Some(c), a, [data, z, z, z], nv);
             }
             let r0 = if n == 1 { self.ld_raw_byte_guarded(Some(act), a) } else { self.ld_raw_u32_guarded(Some(act), a) };
             let z = self.c(0);
@@ -1221,7 +1289,7 @@ impl Lw {
                 let c = self.land(act, ok);
                 let z = self.c(0);
                 let nv = self.c(n);
-                return self.guarded(c, &mut |lw| lw.st_bytes(a, [v, z, z, z], nv));
+                return self.st_bytes(Some(c), a, [v, z, z, z], nv);
             }
             let r0 = if n == 1 { self.ld_raw_byte_guarded(Some(act), a) } else { self.ld_raw_u32_guarded(Some(act), a) };
             let bits = 8 * n;
@@ -1449,7 +1517,7 @@ impl Lw {
                 let c = self.land(act, ok);
                 self.guarded(c, &mut |lw| {
                     let packed = lw.fmt_pack(vals, info);
-                    lw.st_bytes(a, packed, nb)
+                    lw.st_bytes(None, a, packed, nb)
                 })
             }
         }
@@ -1686,22 +1754,8 @@ impl Lw {
     /// Float min / max on `mem` as one integer atomic (the recompiler's `float_minmax_mem`).
     fn float_minmax_mem(&mut self, min: bool, a: Value, v: Value) -> LResult<Value> {
         let (pos, neg) = if min { (AtomicOp::IMin, AtomicOp::UMax) } else { (AtomicOp::IMax, AtomicOp::UMin) };
-        let tmp = self.tmp_var();
-        let z = self.c(0);
-        self.wr(tmp, z);
         let pp = self.cmpc(Pred::ULe, v, 0x7F80_0000);
-        self.guarded(pp, &mut |lw| {
-            let o = lw.mraw_atomic(pos, a, v);
-            lw.wr(tmp, o);
-            Ok(())
-        })?;
-        let np = self.lnot(pp);
-        self.guarded(np, &mut |lw| {
-            let o = lw.mraw_atomic(neg, a, v);
-            lw.wr(tmp, o);
-            Ok(())
-        })?;
-        Ok(self.rd(tmp))
+        Ok(self.if_else_opt(pp, |lw| Ok(Some(lw.mraw_atomic(pos, a, v))), |lw| Ok(Some(lw.mraw_atomic(neg, a, v))))?.unwrap())
     }
 
     pub fn tmp_var(&mut self) -> u32 {
@@ -1739,30 +1793,14 @@ impl Lw {
                 "fmin" | "fmax" => {
                     let min = ops == "fmin";
                     let (pos, neg) = if min { (AtomicOp::IMin, AtomicOp::UMax) } else { (AtomicOp::IMax, AtomicOp::UMin) };
-                    let (tl, th) = (lw.tmp_var(), lw.tmp_var());
-                    let z = lw.c(0);
-                    lw.wr(tl, z);
-                    lw.wr(th, z);
                     let lim = lw.c64(0x7FF0_0000_0000_0000);
                     let pp = lw.cmp(Pred::ULe, v, lim);
-                    for (cond, o) in [(pp, pos), (lw.lnot(pp), neg)] {
-                        lw.guarded(cond, &mut |lw| {
-                            let r = lw.mraw_atomic(o, a, v);
-                            let (l, h) = lw.unpack64(r);
-                            lw.wr(tl, l);
-                            lw.wr(th, h);
-                            Ok(())
-                        })?;
-                    }
-                    let (l, h) = (lw.rd(tl), lw.rd(th));
-                    lw.pack64(l, h)
+                    lw.if_else_opt(pp, |lw| Ok(Some(lw.mraw_atomic(pos, a, v))), |lw| Ok(Some(lw.mraw_atomic(neg, a, v))))?.unwrap()
                 }
                 "inc" | "dec" => {
                     let inc = ops == "inc";
-                    let l0 = lw.mem_ld(a);
-                    let a4 = lw.addc(a, 4);
-                    let h0 = lw.mem_ld(a4);
-                    let init = lw.pack64(l0, h0);
+                    let w0 = lw.mem_ld_n(None, a, 2);
+                    let init = lw.pack64(w0[0], w0[1]);
                     let pre = lw.cur();
                     let lp = lw.block(Some(2));
                     let ex = lw.block(Some(1));
@@ -1910,7 +1948,7 @@ impl Lw {
                 let data = self.d16_data(v, half);
                 let z = self.c(0);
                 let nv = self.c(n);
-                return self.guarded(act, &mut |lw| lw.st_bytes(a, [data, z, z, z], nv));
+                return self.st_bytes(Some(act), a, [data, z, z, z], nv);
             }
             let vd = Self::fv(d, "VDST");
             let v = self.vreg(vd);
@@ -2668,6 +2706,73 @@ mod tests {
                 .filter(|l| l.contains("call ") && l.contains("@dx.op.rawBufferStore.") && l.contains(", i8 15, i32 4)"))
                 .count();
             assert_eq!(vec_stores, mem_windows as usize, "expected {mem_windows} vector rawBufferStore (i8 15):\n{dis}");
+        }
+    }
+
+    #[test]
+    fn guarded_subdword_st_bytes_folds_guards_on_multi_window() {
+        let cases: &[(&str, usize, usize, &[(&str, &str, &[(&str, u64)])])] = &[
+            // 1-byte stores fold the lane/bounds guard into st_part's switch (0 store br i1 + 1 epilogue br i1).
+            ("global_store_byte", 1, 1, &[("GLOBAL_STORE_BYTE", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)])]),
+            ("buffer_store_byte", 1, 1, &[("BUFFER_STORE_BYTE", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)])]),
+            // 2-byte stores keep a single outer guard and fold the spill guard into st_part's 2nd switch.
+            ("global_store_short", 2, 2, &[("GLOBAL_STORE_SHORT", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)])]),
+            ("buffer_store_short", 2, 2, &[("BUFFER_STORE_SHORT", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)])]),
+            // 16-byte format store: 1 outer guard + 1 whole/part if-else + 1 epilogue; spill guards fold into switches.
+            ("tbuffer_store_format_xyzw", 9, 3, &[("TBUFFER_STORE_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1), ("FORMAT", 77)])]),
+        ];
+        for &(label, want_sw, want_br, ops) in cases {
+            let dis = translate_and_dis(ops, 4);
+            let lines = main_lines(&dis);
+            let switches = lines.iter().filter(|l| l.starts_with("switch ")).count();
+            let cond_brs = lines.iter().filter(|l| l.starts_with("br i1 ")).count();
+            assert_eq!(switches, want_sw, "{label} expected {want_sw} switches:\n{dis}");
+            assert_eq!(cond_brs, want_br, "{label} expected {want_br} conditional branches:\n{dis}");
+        }
+    }
+
+    #[test]
+    fn atomic64_inc_dec_uses_single_2dword_initial_load() {
+        let cases: &[(&str, &[(&str, &str, &[(&str, u64)])])] = &[
+            ("global_atomic_inc_x2", &[("GLOBAL_ATOMIC_INC_X2", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)])]),
+            ("buffer_atomic_dec_x2", &[("BUFFER_ATOMIC_DEC_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)])]),
+        ];
+        for &(label, ops) in cases {
+            for mem_windows in [1u32, 4] {
+                let dis = translate_and_dis(ops, mem_windows);
+                let lines = main_lines(&dis);
+                let switches = lines.iter().filter(|l| l.starts_with("switch ")).count();
+                let loads2 = lines.iter().filter(|l| l.contains("call ") && l.contains("@dx.op.rawBufferLoad.") && l.contains(", i8 3, i32 4)")).count();
+                let cmpx = lines.iter().filter(|l| l.contains("call ") && l.contains("@dx.op.atomicCompareExchange.i64")).count();
+                let want_sw = if mem_windows > 1 { 2 } else { 0 };
+                assert_eq!(switches, want_sw, "{label} (w={mem_windows}) expected {want_sw} switches (1 init load + 1 cmpxchg):\n{dis}");
+                assert_eq!(loads2, mem_windows as usize, "{label} (w={mem_windows}) expected {mem_windows} 2-dword rawBufferLoad:\n{dis}");
+                assert_eq!(cmpx, mem_windows as usize, "{label} (w={mem_windows}) expected {mem_windows} i64 cmpxchg:\n{dis}");
+            }
+        }
+    }
+
+    #[test]
+    fn float_minmax_mem_and_atomic64_use_single_if_else_phi() {
+        let cases: &[(&str, bool, &[(&str, &str, &[(&str, u64)])])] = &[
+            ("global_atomic_fmin", false, &[("GLOBAL_ATOMIC_FMIN", "ENC_FLAT_GLBL", &[("VDST", 4), ("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)])]),
+            ("buffer_atomic_fmax", false, &[("BUFFER_ATOMIC_FMAX", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)])]),
+            ("global_atomic_fmin_x2", true, &[("GLOBAL_ATOMIC_FMIN_X2", "ENC_FLAT_GLBL", &[("VDST", 6), ("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0), ("GLC", 1)])]),
+            ("buffer_atomic_fmax_x2", true, &[("BUFFER_ATOMIC_FMAX_X2", "ENC_MUBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1), ("GLC", 1)])]),
+        ];
+        for &(label, is_64, ops) in cases {
+            for mem_windows in [1u32, 4] {
+                let dis = translate_and_dis(ops, mem_windows);
+                let lines = main_lines(&dis);
+                let cond_brs = lines.iter().filter(|l| l.starts_with("br i1 ")).count();
+                let atomics = lines.iter().filter(|l| l.contains("call ") && l.contains("@dx.op.atomicBinOp.")).count();
+                assert_eq!(cond_brs, 3, "{label} (w={mem_windows}) expected 3 br i1 (outer + single if/else + epilogue):\n{dis}");
+                assert!(!lines.iter().any(|l| l.contains("xor i1 ") && l.contains(", true")), "{label} (w={mem_windows}) unexpected negated guard:\n{dis}");
+                assert_eq!(atomics, (mem_windows * 2) as usize, "{label} (w={mem_windows}) expected {} atomicBinOp:\n{dis}", mem_windows * 2);
+                if is_64 {
+                    assert!(lines.iter().any(|l| l.contains("= phi i64 ")), "{label} (w={mem_windows}) missing direct i64 phi:\n{dis}");
+                }
+            }
         }
     }
 }
