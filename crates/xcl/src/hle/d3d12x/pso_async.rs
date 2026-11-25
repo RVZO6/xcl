@@ -146,11 +146,19 @@ pub fn title_held() -> bool {
     HELD.load(Ordering::Acquire) != 0
 }
 
+#[cfg(test)]
+thread_local! {
+    static HELD_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_WAIT_BUDGET: std::cell::Cell<Option<Option<std::time::Duration>>> = const { std::cell::Cell::new(None) };
+}
+
 /// A bind's wait for a pipeline still being built (`title_held`).
 struct Held;
 
 impl Held {
     fn new() -> Held {
+        #[cfg(test)]
+        HELD_ACQUIRES.with(|c| c.set(c.get() + 1));
         HELD.fetch_add(1, Ordering::AcqRel);
         Held
     }
@@ -633,6 +641,16 @@ pub fn resolve(pso: usize) -> usize {
     }
 }
 
+/// Atomic outcome of waiting for a pipeline's background build (`resolve_wait_checked`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveOutcome { Untracked(usize), Ready(usize), Pending, Failed }
+
+fn outcome_when_done(p: &Pending) -> ResolveOutcome {
+    match p.real.load(Ordering::Acquire) { 0 => ResolveOutcome::Failed, r => ResolveOutcome::Ready(r) }
+}
+
+pub fn resolve_wait_checked(pso: usize) -> ResolveOutcome { resolve_wait_for_checked(pso, wait_budget()) }
+
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
 pub fn resolve_wait(pso: usize) -> usize {
@@ -641,26 +659,39 @@ pub fn resolve_wait(pso: usize) -> usize {
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    match resolve_wait_for_checked(pso, budget) { ResolveOutcome::Ready(r) | ResolveOutcome::Untracked(r) => r, ResolveOutcome::Pending | ResolveOutcome::Failed => pso }
+}
+
+fn resolve_wait_for_checked(pso: usize, budget: Option<std::time::Duration>) -> ResolveOutcome {
+    let Some(p) = entry(pso) else { return ResolveOutcome::Untracked(pso) };
     p.note_use();
-    // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
-    }
+    resolve_pending_for(&p, budget)
+}
+
+fn resolve_pending_for(p: &Arc<Pending>, budget: Option<std::time::Duration>) -> ResolveOutcome {
+    let done = p.done.lock().unwrap();
+    if *done { return outcome_when_done(p); }
+    drop(done);
+    if let Some(budget) = budget { return resolve_within(p, budget); }
+    let _held = Held::new();
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(p, job());
     }
     p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
-        0 => pso,
-        r => r,
-    }
+    outcome_when_done(p)
+}
+
+#[cfg(test)]
+pub(super) fn with_test_wait_budget<R>(budget: Option<std::time::Duration>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<Option<std::time::Duration>>);
+    impl Drop for Reset { fn drop(&mut self) { TEST_WAIT_BUDGET.with(|b| b.set(self.0)); } }
+    let _reset = Reset(TEST_WAIT_BUDGET.with(|b| b.replace(Some(budget))));
+    f()
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -668,6 +699,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
 /// has been held 30 s.
 fn wait_budget() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(budget) = TEST_WAIT_BUDGET.with(|b| b.get()) { return budget; }
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
@@ -675,30 +708,25 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
-    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
-        0 => pso,
-        r => r,
-    };
-    if *p.done.lock().unwrap() {
-        return built(p);
-    }
+fn resolve_within(p: &Arc<Pending>, budget: std::time::Duration) -> ResolveOutcome {
     let newly_sent = !p.sent.swap(true, Ordering::AcqRel);
     if p.late.load(Ordering::Acquire) {
         if newly_sent {
             queue().push(p.clone(), false);
         }
-        return pso;
+        return ResolveOutcome::Pending;
     }
+    // (the title's thread is held from here until the pipeline is built or the budget is over)
+    let _held = Held::new();
     p.want();
     if newly_sent {
         queue().push(p.clone(), true);
-    } else if !*p.done.lock().unwrap() {
+    } else {
         queue().promote(p.clone());
     }
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
     if *done {
-        return built(p);
+        return outcome_when_done(p);
     }
     drop(done);
     p.late.store(true, Ordering::Release);
@@ -707,7 +735,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if n < 16 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
-    pso
+    ResolveOutcome::Pending
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
@@ -860,5 +888,38 @@ mod tests {
         })).is_err());
         assert_eq!(preload.state.lock().unwrap().active_compute, 0);
         assert_eq!(preload.pop().unwrap().0.key, 11);
+    }
+
+    #[test]
+    fn resolve_wait_checked_distinguishes_untracked_ready_pending_and_failed() {
+        let (untracked, ready, pending, failed) = (0x7E57_C001usize, 0x7E57_C002usize, 0x7E57_C003usize, 0x7E57_C004usize);
+        assert_eq!((resolve_wait_checked(untracked), resolve_wait_checked(0)), (ResolveOutcome::Untracked(untracked), ResolveOutcome::Untracked(0)));
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        submit_lazy(ready, false, Box::new(|| 0x7E57_C101), 0);
+        submit_lazy(failed, false, Box::new(|| 0), 0);
+        submit_lazy(pending, false, Box::new(move || { let _ = go_rx.recv_timeout(Duration::from_secs(5)); 0 }), 0);
+        assert_eq!((resolve_wait_for_checked(ready, None), resolve_wait_for_checked(ready, Some(Duration::from_millis(5))), resolve_wait(ready)), (ResolveOutcome::Ready(0x7E57_C101), ResolveOutcome::Ready(0x7E57_C101), 0x7E57_C101));
+        assert_eq!((resolve_wait_for_checked(failed, None), resolve_wait_for_checked(failed, Some(Duration::from_millis(5))), resolve_wait(failed)), (ResolveOutcome::Failed, ResolveOutcome::Failed, failed));
+        assert_eq!(with_test_wait_budget(Some(Duration::from_millis(5)), || resolve_wait_checked(pending)), ResolveOutcome::Pending);
+        assert!(is_pending(pending));
+        for k in [ready, failed, pending] { let _ = released(k); }
+        let _ = go_tx.send(());
+        assert_eq!(resolve_wait_checked(ready), ResolveOutcome::Untracked(ready));
+    }
+
+    #[test]
+    fn late_pipeline_does_not_hold_title_on_subsequent_binds() {
+        let (p, held) = (test_pending(true, 0, None), || HELD_ACQUIRES.with(|c| c.get()));
+        let b = held();
+        assert_eq!(resolve_pending_for(&p, Some(Duration::from_millis(1))), ResolveOutcome::Pending);
+        assert_eq!((held(), p.late.load(Ordering::Acquire)), (b + 1, true));
+        let (b, t) = (held(), std::time::Instant::now());
+        assert_eq!(resolve_pending_for(&p, Some(Duration::from_secs(10))), ResolveOutcome::Pending);
+        assert_eq!(held(), b, "late pipeline must not construct Held");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        complete(&p, 0x7E57_C201);
+        let b = held();
+        assert_eq!(resolve_pending_for(&p, Some(Duration::from_secs(10))), ResolveOutcome::Ready(0x7E57_C201));
+        assert_eq!(held(), b, "completed pipeline must not construct Held");
     }
 }
