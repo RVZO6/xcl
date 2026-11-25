@@ -251,6 +251,17 @@ pub(super) fn pop_spare(wrapper: *mut c_void) -> Option<*mut c_void> {
     sg.as_mut()?.get_mut(&(wrapper as usize))?.spares.pop().map(|p| p as *mut c_void)
 }
 
+/// Release a popped spare split segment whose `Reset` failed so it does not leak.
+pub(super) unsafe fn release_failed_spare(seg: *mut c_void) {
+    if seg.is_null() {
+        return;
+    }
+    super::list_x::on_release(seg as usize);
+    super::bind::forget(seg);
+    let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(seg, 2));
+    rel(seg);
+}
+
 /// Switch `wrapper` from closed segment `old_pc` to newly opened segment `new_pc`.
 pub(super) unsafe fn activate_segment(wrapper: *mut c_void, old_pc: *mut c_void, new_pc: *mut c_void) {
     *((wrapper as usize + F_BACKING) as *mut usize) = new_pc as usize;
@@ -353,12 +364,18 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     if n == 0 {
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
+            let owner = this as usize;
             let mut wg = WRAPPER_OF.lock().unwrap();
             if let Some(m) = wg.as_mut() {
-                m.remove(&(pc as usize));
+                let pc_key = pc as usize;
+                if m.get(&pc_key) == Some(&owner) {
+                    m.remove(&pc_key);
+                }
                 if let Some(ref b) = book {
                     for &seg in b.extra_active.iter().chain(b.spares.iter()) {
-                        m.remove(&seg);
+                        if m.get(&seg) == Some(&owner) {
+                            m.remove(&seg);
+                        }
                     }
                 }
             }
@@ -440,5 +457,74 @@ mod tests {
             assert_eq!(r(o), 0); // the object is freed with it
             drop(Box::from_raw(fake));
         }
+    }
+
+    #[test]
+    fn title_list_release_aba_does_not_erase_recycled_pc_wrapper() {
+        #[repr(C)]
+        struct AbaFake { vt: *const usize, refs: u32, recycle: bool, new_wrapper: *mut c_void }
+        unsafe extern "system" fn aba_release(this: *mut c_void) -> u32 {
+            let f = &mut *(this as *mut AbaFake);
+            f.refs -= 1;
+            if f.refs == 0 && f.recycle {
+                f.recycle = false;
+                f.refs = 1;
+                f.new_wrapper = wrap(this);
+                return 0;
+            }
+            f.refs
+        }
+        let (mut vt_aba, mut vt_plain) = (vec![0usize; LIST_SLOTS], vec![0usize; LIST_SLOTS]);
+        vt_aba[2] = aba_release as usize;
+        vt_plain[2] = fake_release as usize;
+        let pc = Box::into_raw(Box::new(AbaFake { vt: vt_aba.as_ptr(), refs: 1, recycle: true, new_wrapper: std::ptr::null_mut() }));
+        let extra = Box::into_raw(Box::new(Fake { vt: vt_plain.as_ptr(), refs: 1 }));
+        let spare = Box::into_raw(Box::new(Fake { vt: vt_plain.as_ptr(), refs: 1 }));
+        unsafe {
+            let old_w = wrap(pc as *mut c_void);
+            activate_segment(old_w, pc as *mut c_void, extra as *mut c_void);
+            SEGMENTS.lock().unwrap().as_mut().unwrap().get_mut(&(old_w as usize)).unwrap().spares.push(spare as usize);
+            let foreign = spare as usize;
+            WRAPPER_OF.lock().unwrap().as_mut().unwrap().insert(spare as usize, foreign);
+            let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(old_w as *const *const usize)).add(2));
+            assert_eq!(rel(old_w), 0);
+            let new_w = (*pc).new_wrapper;
+            let (pc_after, extra_after, spare_after) = (wrapper_of(pc as *mut c_void), wrapper_of(extra as *mut c_void), wrapper_of(spare as *mut c_void));
+            WRAPPER_OF.lock().unwrap().as_mut().unwrap().remove(&(spare as usize));
+            assert!(!new_w.is_null() && new_w != old_w);
+            assert_eq!(pc_after, Some(new_w), "ABA release must not erase recycled pc's new wrapper");
+            assert_eq!(extra_after, None, "owned extra segment must be removed from WRAPPER_OF");
+            assert_eq!(spare_after, Some(foreign as *mut c_void), "unowned segment key must stay intact");
+            assert_eq!(((*extra).refs, (*spare).refs), (0, 0));
+            let rel_new: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(new_w as *const *const usize)).add(2));
+            assert_eq!(rel_new(new_w), 0);
+            assert_eq!((wrapper_of(pc as *mut c_void), (*pc).refs), (None, 0));
+            drop(Box::from_raw(pc));
+            drop(Box::from_raw(extra));
+            drop(Box::from_raw(spare));
+        }
+    }
+
+    #[test]
+    fn release_failed_spare_forgets_state_and_drops_com_ref() {
+        let mut vt = vec![0usize; LIST_SLOTS];
+        vt[2] = fake_release as usize;
+        let fake = Box::into_raw(Box::new(Fake { vt: vt.as_ptr(), refs: 1 }));
+        let alloc_id = Box::new(0u8);
+        let alloc = std::ptr::from_ref(&*alloc_id) as usize;
+        let spare = fake as *mut c_void;
+        super::super::bind::seed_reset_state_for_test(spare, alloc, 0x555, vec![0x9999]);
+        unsafe {
+            release_failed_spare(std::ptr::null_mut());
+            release_failed_spare(spare);
+        }
+        let pending = super::super::console_list::take_pending_for_test(alloc);
+        let bind_state = super::super::bind::reset_state_for_test(spare);
+        super::super::bind::remove_state_for_test(spare);
+        let refs = unsafe { (*fake).refs };
+        unsafe { drop(Box::from_raw(fake)) };
+        assert_eq!(refs, 0, "failed spare COM ref must be released");
+        assert_eq!(pending, vec![0x9999], "bind::forget must hand UMA blocks to allocator cleanup");
+        assert_eq!(bind_state, (0, 0, Vec::new(), Vec::new(), Vec::new()), "bind state must be forgotten");
     }
 }
