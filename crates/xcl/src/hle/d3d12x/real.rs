@@ -6243,6 +6243,10 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    if super::title_textures::is_own_work() {
+        f(this, n, lists);
+        return;
+    }
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
@@ -7318,5 +7322,47 @@ mod tests {
         assert!(!p_new.exists());
         driver_cache::note_with_debug_layer(false, Some(&p), false);
         assert!(!p.exists());
+    }
+}
+
+#[cfg(test)]
+mod own_work_tests {
+    use super::*;
+
+    #[test]
+    fn own_work_execute_command_lists_skips_title_queue_and_list_tracking() {
+        #[repr(C)]
+        struct MockQueue { vtable: *const usize, calls: usize, last_n: u32, last_list: usize }
+        unsafe extern "system" fn no_iface(_: *mut c_void, _: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+            if !ppv.is_null() { *ppv = std::ptr::null_mut(); }
+            E_NOINTERFACE
+        }
+        unsafe extern "system" fn ref_op(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn exec(this: *mut c_void, n: u32, lists: *const *mut c_void) {
+            let q = &mut *this.cast::<MockQueue>();
+            (q.calls, q.last_n, q.last_list) = (q.calls + 1, n, if n > 0 && !lists.is_null() { *lists as usize } else { 0 });
+        }
+        unsafe extern "system" fn get_desc(_: *mut c_void, out: *mut D3D12_COMMAND_QUEUE_DESC) -> *mut D3D12_COMMAND_QUEUE_DESC {
+            if !out.is_null() { *out = D3D12_COMMAND_QUEUE_DESC::default(); }
+            out
+        }
+        unsafe extern "system" fn noop() -> usize { 0 }
+        static VTABLE: std::sync::LazyLock<[usize; 20]> = std::sync::LazyLock::new(|| {
+            let mut v = [noop as usize; 20];
+            (v[0], v[1], v[2], v[7], v[10], v[18], v[19]) = (no_iface as usize, ref_op as usize, ref_op as usize, no_iface as usize, exec as usize, get_desc as usize, 1);
+            v
+        });
+        let mut mock = MockQueue { vtable: VTABLE.as_ptr(), calls: 0, last_n: 0, last_list: 0 };
+        let q_ptr = std::ptr::from_mut(&mut mock).cast::<c_void>();
+        let (q_raw, fake_list) = (q_ptr as usize, 0x7E57_2109_0000usize as *mut c_void);
+        let lists = [fake_list];
+        unsafe {
+            adopt(q_ptr, Kind::CommandQueue);
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(*vt(q_ptr).add(10));
+            super::super::title_textures::own_work(|| f(q_ptr, 1, lists.as_ptr()));
+        }
+        assert_eq!((mock.calls, mock.last_n, mock.last_list), (1, 1, fake_list as usize));
+        assert!(!super::super::list_x::is_live_queue(q_raw) && !super::super::list_x::has_list_state(fake_list as usize));
+        assert!(!super::super::present::known_queues().contains(&q_raw));
     }
 }

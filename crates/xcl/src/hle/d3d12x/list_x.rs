@@ -829,6 +829,11 @@ pub(super) fn has_list_state(list: usize) -> bool {
     LISTS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
 }
 
+#[cfg(test)]
+pub(super) fn is_live_queue(queue: usize) -> bool {
+    LIVE_QUEUES.lock().unwrap().iter().any(|q| q.queue == queue)
+}
+
 /// Forget a released command allocator so `KickoffX` will not reset a list with a dead allocator.
 pub(super) fn on_allocator_release(alloc: usize) {
     if let Some(m) = LISTS.lock().unwrap().as_mut() {
