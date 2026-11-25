@@ -22,6 +22,18 @@ impl Src {
     }
 }
 
+/// Quad-local permutation `[p0, p1, p2, p3]` for DPP16 `quad_perm` and `row_xmask:0..3`.
+fn dpp16_quad_perm(ctrl: u64) -> Option<[u32; 4]> {
+    match ctrl {
+        0x000..=0x0FF => Some([0, 2, 4, 6].map(|sh| ((ctrl >> sh) & 3) as u32)),
+        0x160..=0x163 => {
+            let n = (ctrl & 3) as u32;
+            Some([0 ^ n, 1 ^ n, 2 ^ n, 3 ^ n])
+        }
+        _ => None,
+    }
+}
+
 impl Lw {
     pub fn mods(d: &Decoded) -> Mods {
         let fv = |e: &Encoding, n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
@@ -100,15 +112,26 @@ impl Lw {
         let n = (ctrl & 15) as u32;
         let l = self.lane;
         let src = match ctrl {
-            0x000..=0x0FF => {
-                let a = self.andc(l, !3);
-                let q = self.andc(l, 3);
-                let sh = self.shlc(q, 1);
-                let k = self.c(ctrl as u32);
-                let s = self.bin(BinOp::LShr, k, sh);
-                let s = self.andc(s, 3);
-                self.or(a, s)
-            }
+            0x000..=0x0FF => match dpp16_quad_perm(ctrl).unwrap() {
+                [0, 1, 2, 3] => l,
+                [1, 0, 3, 2] => { let k = self.c(1); self.xor(l, k) }
+                [2, 3, 0, 1] => { let k = self.c(2); self.xor(l, k) }
+                [3, 2, 1, 0] => { let k = self.c(3); self.xor(l, k) }
+                [k, a, b, c] if a == k && b == k && c == k => {
+                    let a = self.andc(l, !3);
+                    let kk = self.c(k);
+                    self.or(a, kk)
+                }
+                _ => {
+                    let a = self.andc(l, !3);
+                    let q = self.andc(l, 3);
+                    let sh = self.shlc(q, 1);
+                    let k = self.c(ctrl as u32);
+                    let s = self.bin(BinOp::LShr, k, sh);
+                    let s = self.andc(s, 3);
+                    self.or(a, s)
+                }
+            },
             0x101..=0x10F => {
                 let r = self.andc(l, 15);
                 let r = self.addc(r, n);
@@ -204,18 +227,26 @@ impl Lw {
                 if d.variant == Variant::Dpp16 {
                     let ctrl = fv("DPP_CTRL");
                     let (fi, bound) = (fv("FI") == 1, fv("BOUND_CTRL") == 1);
-                    let (lc, valid) = self.dpp16_src(ctrl).ok_or_else(|| format!("{}: DPP_CTRL", rdna2::format(d)))?;
                     let and_opt = |lw: &mut Lw, a: Option<Value>, b: Option<Value>| match (a, b) {
                         (Some(x), Some(y)) => Some(lw.land(x, y)),
                         (Some(x), None) | (None, Some(x)) => Some(x),
                         (None, None) => None,
                     };
-                    let on = (!fi).then(|| {
-                        let (el, eh) = self.exec_mask();
-                        self.lanebit_at(el, eh, lc)
-                    });
-                    let ok = and_opt(self, valid, on);
-                    let r = self.read_lane_half(v, lc);
+                    let (r, ok) = if let Some(p) = dpp16_quad_perm(ctrl).filter(|_| self.supports_quad_ops()) {
+                        let on = (!fi).then(|| {
+                            let (lc, _) = self.dpp16_src(ctrl).unwrap();
+                            let (el, eh) = self.exec_mask();
+                            self.lanebit_at(el, eh, lc)
+                        });
+                        (self.read_lane_quad(v, p), on)
+                    } else {
+                        let (lc, valid) = self.dpp16_src(ctrl).ok_or_else(|| format!("{}: DPP_CTRL", rdna2::format(d)))?;
+                        let on = (!fi).then(|| {
+                            let (el, eh) = self.exec_mask();
+                            self.lanebit_at(el, eh, lc)
+                        });
+                        (self.read_lane_half(v, lc), and_opt(self, valid, on))
+                    };
                     let (rm, bm) = (fv("ROW_MASK") as u32, fv("BANK_MASK") as u32);
                     let mask_ok = |lw: &mut Lw, mask: u32, idx: fn(&mut Lw, Value) -> Value| match mask {
                         0xF => None,
@@ -1392,7 +1423,7 @@ mod tests {
         assert!(!fi.iter().any(|l| l.contains("@dx.op.binary.i32(i32 37,")), "unexpected IMax clamp:\n{fast}");
         assert!(!fi.iter().any(|l| l.contains("lshr i32 15,")), "unexpected row/bank mask probe:\n{fast}");
         let (fl, ml) = (fi.iter().filter(|l| l.contains("lshr ")).count(), mi.iter().filter(|l| l.contains("lshr ")).count());
-        assert_eq!((fl, ml), (2, 7), "lshr counts:\n{fast}\n---\n{masked}");
+        assert_eq!((fl, ml), (1, 6), "lshr counts:\n{fast}\n---\n{masked}");
         assert!(fi.len() + 10 < mi.len(), "expected fewer IR insts ({} vs {}):\n{fast}\n---\n{masked}", fi.len(), mi.len());
     }
 

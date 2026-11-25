@@ -9,9 +9,10 @@
 //! `v_readlane` values. Lane reads the ISA keeps inside a 32-lane half (DPP,
 //! `ds_swizzle`, permlane) need no exchange.
 
+use super::container::Stage;
 use super::lower::{Lw, Partner};
 use super::module::{BinOp, Pred, RmwOp, Value};
-use super::ops::barrier;
+use super::ops::{barrier, QuadDir};
 
 impl Lw {
     /// Groupshared storage, created in the entry block before anything else:
@@ -473,7 +474,7 @@ impl Lw {
     /// `v` of lane `l` (the same index in every lane: v_readlane, v_readfirstlane).
     pub fn read_lane_uniform(&mut self, v: Value, l: Value) -> Value {
         if !self.split {
-            return self.rla(v, l);
+            return self.rla_ps(v, l, true);
         }
         let l31 = self.andc(l, 31);
         let m = self.s.wave_read_lane_at(v, l31);
@@ -493,19 +494,48 @@ impl Lw {
         }
     }
 
+    /// Whether this shader stage supports SM 6.6 DXIL quad ops (PS, CS, MS, AS).
+    pub fn supports_quad_ops(&self) -> bool {
+        matches!(self.s.stage, Stage::Pixel | Stage::Compute | Stage::Mesh | Stage::Amplification)
+    }
+
+    /// Reads `v` from quad-local lane `p[lane & 3]` using DXIL quad ops.
+    pub fn read_lane_quad(&mut self, v: Value, p: [u32; 4]) -> Value {
+        assert!(self.supports_quad_ops(), "quad ops are invalid in stage {:?}", self.s.stage);
+        match p {
+            [0, 1, 2, 3] => return v,
+            [1, 0, 3, 2] => return self.s.quad_op(v, QuadDir::ReadAcrossX),
+            [2, 3, 0, 1] => return self.s.quad_op(v, QuadDir::ReadAcrossY),
+            [3, 2, 1, 0] => return self.s.quad_op(v, QuadDir::ReadAcrossDiagonal),
+            [k, a, b, c] if a == k && b == k && c == k => { let kk = self.c(k & 3); return self.s.quad_read_lane_at(v, kk); }
+            _ => {}
+        }
+        let mut cache = [None; 4];
+        let r = p.map(|k| *cache[(k & 3) as usize].get_or_insert_with(|| { let kk = self.c(k & 3); self.s.quad_read_lane_at(v, kk) }));
+        let b1 = (r[0] != r[1] || r[2] != r[3]).then(|| { let x = self.andc(self.lane, 1); self.nz(x) });
+        let lo = if r[0] == r[1] { r[0] } else { self.sel(b1.unwrap(), r[1], r[0]) };
+        let hi = if r[2] == r[3] { r[2] } else if r[2] == r[0] && r[3] == r[1] { lo } else { self.sel(b1.unwrap(), r[3], r[2]) };
+        if lo == hi {
+            return lo;
+        }
+        let b2 = self.andc(self.lane, 2);
+        let b2 = self.nz(b2);
+        self.sel(b2, hi, lo)
+    }
+
     /// The HLSL `rla(v, l)`: `WaveReadLaneAt(v, l + 32 · xcl_half)`; in a pixel shader, lanes
     /// of the reader's own quad through quad reads (they see helper lanes, wave reads do
     /// not), and a helper lane of another quad through a live lane of that quad.
     pub fn rla(&mut self, v: Value, l: Value) -> Value {
-        let h = self.hw_lane(l);
-        let w = self.s.wave_read_lane_at(v, h);
+        self.rla_ps(v, l, false)
+    }
+
+    fn rla_ps(&mut self, v: Value, l: Value, uniform: bool) -> Value {
         if !self.gfx.as_ref().is_some_and(|g| g.ps.is_some()) {
-            return w;
+            let h = self.hw_lane(l);
+            return self.s.wave_read_lane_at(v, h);
         }
-        let q: Vec<Value> = (0..4u32).map(|k| {
-            let kk = self.c(k);
-            self.s.quad_read_lane_at(v, kk)
-        }).collect();
+        let uniform = uniform || self.s.m.const_u64(l).is_some();
         let pick = |lw: &mut Lw, r: &[Value]| -> Value {
             let b1 = lw.andc(l, 1);
             let b1 = lw.nz(b1);
@@ -515,38 +545,50 @@ impl Lw {
             let lo = lw.sel(b1, r[1], r[0]);
             lw.sel(b2, hi, lo)
         };
-        let qv = pick(self, &q);
+        let (q, qv) = if let (true, Some(k)) = (uniform, self.s.m.const_u64(l)) {
+            let kk = self.c((k & 3) as u32);
+            let qv = self.s.quad_read_lane_at(v, kk);
+            ([qv; 4], qv)
+        } else {
+            let q = [0, 1, 2, 3].map(|k| { let kk = self.c(k); self.s.quad_read_lane_at(v, kk) });
+            (q, pick(self, &q))
+        };
         let t = self.s.m.i1c(true);
         let lv = self.s.wave_ballot(t);
-        let wi = self.lshrc(h, 5);
-        let k3 = self.c(3);
-        let wi = self.umin(wi, k3);
-        let lvw = {
-            let mut x = lv[3];
-            for k in (0..3).rev() {
-                let is = self.cmpc(Pred::Eq, wi, k);
-                x = self.sel(is, lv[k as usize], x);
-            }
-            x
+        let lvw = if let Some(half) = self.gfx_half {
+            self.sel(half, lv[1], lv[0])
+        } else if !self.wave64 {
+            lv[0]
+        } else {
+            let up = self.cmpc(Pred::UGe, l, 32);
+            self.sel(up, lv[1], lv[0])
         };
-        let sh = self.andc(h, 28);
+        let sh = self.andc(l, 28);
         let nib = self.bin(BinOp::LShr, lvw, sh);
         let nib = self.andc(nib, 15);
-        let qbase = self.andc(h, !3);
+        let lq4 = self.andc(l, !3);
+        let qbase = self.hw_lane(lq4);
         let fl = self.firstbitlow(nib);
-        let src = self.add(qbase, fl);
-        let r: Vec<Value> = q.iter().map(|&qq| self.s.wave_read_lane_at(qq, src)).collect();
+        let fl = self.andc(fl, 3);
+        let src = self.or(qbase, fl);
+        let lq = self.lshrc(l, 2);
+        let mq = self.lshrc(self.lane, 2);
+        let same = self.cmp(Pred::Eq, lq, mq);
+        if uniform {
+            let rv = self.s.wave_read_lane_at(qv, src);
+            return self.sel(same, qv, rv);
+        }
+        let h = self.hw_lane(l);
+        let w = self.s.wave_read_lane_at(v, h);
+        let r = q.map(|qq| self.s.wave_read_lane_at(qq, src));
         let rv = pick(self, &r);
-        let h3 = self.andc(h, 3);
+        let h3 = self.andc(l, 3);
         let own = self.bin(BinOp::LShr, nib, h3);
         let own = self.andc(own, 1);
         let helper = self.cmpc(Pred::Eq, own, 0);
         let nnz = self.nz(nib);
         let use_r = self.land(nnz, helper);
         let w = self.sel(use_r, rv, w);
-        let lq = self.lshrc(l, 2);
-        let mq = self.lshrc(self.lane, 2);
-        let same = self.cmp(Pred::Eq, lq, mq);
         self.sel(same, qv, w)
     }
 
