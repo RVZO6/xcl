@@ -171,16 +171,52 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
     let pi1 = lw.addc(pi, 1);
     let step_f = word(lw, steps, pi1);
     let (taken, not_taken) = (lw.add(b, step_t), lw.add(b, step_f));
+    const SWITCH_GROUP_SHIFT: u32 = 5;
+    const SWITCH_GROUP_SIZE: usize = 1 << SWITCH_GROUP_SHIFT;
+
     let cases: Vec<Block> = p.rep.iter().map(|_| lw.block(Some(0))).collect();
     let latch = lw.block(Some(0));
-    let arms: Vec<(Value, Block)> = cases.iter().enumerate().skip(1).map(|(k, &c)| (lw.c(k as u32), c)).collect();
-    lw.s.m.switch(class, cases[0], &arms);
-    for (&c, &r) in cases.iter().zip(&p.rep) {
+    let nested = cases.len() > SWITCH_GROUP_SIZE;
+    let group_joins: Vec<Block> = if nested {
+        let group = lw.lshrc(class, SWITCH_GROUP_SHIFT);
+        let sub = lw.andc(class, (SWITCH_GROUP_SIZE - 1) as u32);
+        let ngroups = cases.len().div_ceil(SWITCH_GROUP_SIZE);
+        let mut group_targets = Vec::with_capacity(ngroups);
+        let mut joins = Vec::with_capacity(ngroups);
+        for chunk in cases.chunks(SWITCH_GROUP_SIZE) {
+            if chunk.len() == 1 {
+                group_targets.push(chunk[0]);
+                joins.push(latch);
+            } else {
+                group_targets.push(lw.block(Some(0)));
+                joins.push(lw.block(Some(0)));
+            }
+        }
+        let outer_arms: Vec<(Value, Block)> = group_targets.iter().enumerate().skip(1).map(|(g, &b)| (lw.c(g as u32), b)).collect();
+        lw.s.m.switch(group, group_targets[0], &outer_arms);
+        for (chunk, &gb) in cases.chunks(SWITCH_GROUP_SIZE).zip(&group_targets) {
+            if chunk.len() > 1 {
+                lw.s.m.set_block(gb);
+                let inner_arms: Vec<(Value, Block)> = chunk.iter().enumerate().skip(1).map(|(k, &c)| (lw.c(k as u32), c)).collect();
+                lw.s.m.switch(sub, chunk[0], &inner_arms);
+            }
+        }
+        joins
+    } else {
+        let arms: Vec<(Value, Block)> = cases.iter().enumerate().skip(1).map(|(k, &c)| (lw.c(k as u32), c)).collect();
+        lw.s.m.switch(class, cases[0], &arms);
+        Vec::new()
+    };
+    for (k, (&c, &r)) in cases.iter().zip(&p.rep).enumerate() {
+        let join = if nested { group_joins[k / SWITCH_GROUP_SIZE] } else { latch };
+        let header = cfg.headers.contains(&p.order[r]);
+        let done = (nested && header).then(|| lw.block(Some(0)));
+        let target = done.unwrap_or(join);
         lw.s.m.set_block(c);
         lw.init.mem = Some(c);
         lw.ssa.begin_log();
         let blk = &cfg.blocks[p.order[r]];
-        if cfg.headers.contains(&p.order[r]) {
+        if header {
             // a loop head spends the loop budget
             let left = lw.s.m.load(budget, 4);
             let none = lw.cmpc(Pred::Eq, left, 0);
@@ -189,7 +225,7 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
             lw.s.m.set_block(out);
             let end = lw.c(END);
             lw.s.m.store(to, end, 4);
-            lw.s.m.br(latch);
+            lw.s.m.br(target);
             lw.s.m.set_block(body);
             let one = lw.c(1);
             let l = lw.sub(left, one);
@@ -211,7 +247,17 @@ pub fn emit(lw: &mut Lw, cfg: &Cfg, p: &Plan, head: Block, exit: Block) -> LResu
             lw.s.m.store(p, v, 4);
         }
         lw.s.m.store(to, next, 4);
-        lw.s.m.br(latch);
+        lw.s.m.br(target);
+        if let Some(d) = done {
+            lw.s.m.set_block(d);
+            lw.s.m.br(join);
+        }
+    }
+    for &gj in &group_joins {
+        if gj != latch {
+            lw.s.m.set_block(gj);
+            lw.s.m.br(latch);
+        }
     }
     // the epilogue's reads load here
     lw.init.mem = Some(latch);
