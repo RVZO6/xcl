@@ -884,6 +884,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
+            crate::hle::kernelx::lazy::ensure(r.source as usize, r.source_size as usize);
             if !crate::gpu::shader::readable(r.source as usize, r.source_size as usize) {
                 return Err(E_ACCESS_VIOLATION);
             }
