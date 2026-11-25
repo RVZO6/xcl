@@ -95,11 +95,11 @@ impl Lw {
         self.bits(s)
     }
 
-    /// DPP16 source lane (i32, −1 = none) of lane `lane`.
-    fn dpp16_src(&mut self, ctrl: u64) -> Option<Value> {
+    /// DPP16 source lane (non-negative i32) and optional in-bounds check (`None` = always in bounds).
+    fn dpp16_src(&mut self, ctrl: u64) -> Option<(Value, Option<Value>)> {
         let n = (ctrl & 15) as u32;
         let l = self.lane;
-        Some(match ctrl {
+        let src = match ctrl {
             0x000..=0x0FF => {
                 let a = self.andc(l, !3);
                 let q = self.andc(l, 3);
@@ -114,16 +114,16 @@ impl Lw {
                 let r = self.addc(r, n);
                 let ok = self.cmpc(Pred::ULt, r, 16);
                 let t = self.addc(l, n);
-                let m1 = self.c(u32::MAX);
-                self.sel(ok, t, m1)
+                let z = self.c(0);
+                return Some((self.sel(ok, t, z), Some(ok)));
             }
             0x111..=0x11F => {
                 let r = self.andc(l, 15);
                 let ok = self.cmpc(Pred::UGe, r, n);
                 let k = self.c(n);
                 let t = self.sub(l, k);
-                let m1 = self.c(u32::MAX);
-                self.sel(ok, t, m1)
+                let z = self.c(0);
+                return Some((self.sel(ok, t, z), Some(ok)));
             }
             0x121..=0x12F => {
                 let a = self.andc(l, !15);
@@ -159,7 +159,8 @@ impl Lw {
                 self.xor(l, k)
             }
             _ => return None,
-        })
+        };
+        Some((src, None))
     }
 
     /// Source dwords in operand order; SGPR-pair masks as `Src::Pair`. SDWA
@@ -199,41 +200,44 @@ impl Lw {
                 let e = ext_encoding(d).ok_or_else(|| format!("{}: DPP", rdna2::format(d)))?;
                 let fv = |n: &str| rdna2::field_value(e, &d.words, n).unwrap_or(0);
                 let v = self.vreg(fv("VSRC0"));
-                let (el, eh) = self.exec_mask();
                 let t;
                 if d.variant == Variant::Dpp16 {
                     let ctrl = fv("DPP_CTRL");
                     let (fi, bound) = (fv("FI") == 1, fv("BOUND_CTRL") == 1);
-                    let l = self.dpp16_src(ctrl).ok_or_else(|| format!("{}: DPP_CTRL", rdna2::format(d)))?;
-                    let z = self.c(0);
-                    let valid = self.cmp(Pred::SGe, l, z);
-                    let lc = self.imax(l, z);
-                    let on = self.lanebit_at(el, eh, lc);
-                    let fib = self.b(fi);
-                    let ok0 = self.lor(fib, on);
-                    let ok = self.land(valid, ok0);
+                    let (lc, valid) = self.dpp16_src(ctrl).ok_or_else(|| format!("{}: DPP_CTRL", rdna2::format(d)))?;
+                    let and_opt = |lw: &mut Lw, a: Option<Value>, b: Option<Value>| match (a, b) {
+                        (Some(x), Some(y)) => Some(lw.land(x, y)),
+                        (Some(x), None) | (None, Some(x)) => Some(x),
+                        (None, None) => None,
+                    };
+                    let on = (!fi).then(|| {
+                        let (el, eh) = self.exec_mask();
+                        self.lanebit_at(el, eh, lc)
+                    });
+                    let ok = and_opt(self, valid, on);
                     let r = self.read_lane_half(v, lc);
                     let (rm, bm) = (fv("ROW_MASK") as u32, fv("BANK_MASK") as u32);
-                    let lane = self.lane;
-                    let row = self.lshrc(lane, 4);
-                    let k = self.c(rm);
-                    let rb = self.bin(BinOp::LShr, k, row);
-                    let rb = self.andc(rb, 1);
-                    let rok = self.nz(rb);
-                    let bank = self.lshrc(lane, 2);
-                    let bank = self.andc(bank, 3);
-                    let k = self.c(bm);
-                    let bb = self.bin(BinOp::LShr, k, bank);
-                    let bb = self.andc(bb, 1);
-                    let bok = self.nz(bb);
-                    let mut en = self.land(rok, bok);
-                    if bound {
-                        t = self.sel(ok, r, z);
+                    let mask_ok = |lw: &mut Lw, mask: u32, idx: fn(&mut Lw, Value) -> Value| match mask {
+                        0xF => None,
+                        0 => Some(lw.b(false)),
+                        _ => {
+                            let i = idx(lw, lw.lane);
+                            let k = lw.c(mask);
+                            let b = lw.bin(BinOp::LShr, k, i);
+                            let b = lw.andc(b, 1);
+                            Some(lw.nz(b))
+                        }
+                    };
+                    let rok = mask_ok(self, rm, |lw, l| lw.lshrc(l, 4));
+                    let bok = mask_ok(self, bm, |lw, l| { let b = lw.lshrc(l, 2); lw.andc(b, 3) });
+                    let mut en = and_opt(self, rok, bok);
+                    t = if bound {
+                        ok.map_or(r, |ok| { let z = self.c(0); self.sel(ok, r, z) })
                     } else {
-                        en = self.land(en, ok);
-                        t = r;
-                    }
-                    self.dpp_enable = Some(en);
+                        en = and_opt(self, en, ok);
+                        r
+                    };
+                    self.dpp_enable = en;
                 } else {
                     let sel: u64 = (0..8).map(|i| fv(&format!("LANE_SEL_{i}")) << (3 * i)).sum();
                     let fi = rdna2::field_value(d.enc, &d.words, "SRC0").unwrap_or(0) == 0xEA;
@@ -248,6 +252,7 @@ impl Lw {
                     let l = self.or(a, s);
                     let r = self.read_lane_half(v, l);
                     t = if !fi {
+                        let (el, eh) = self.exec_mask();
                         let on = self.lanebit_at(el, eh, l);
                         let z = self.c(0);
                         self.sel(on, r, z)
@@ -988,15 +993,13 @@ impl Lw {
                 };
                 let l = self.or(base, row);
                 let l = self.or(l, nsel);
-                let (el, eh) = self.exec_mask();
-                let on = self.lanebit_at(el, eh, l);
-                let fib = self.b(fi);
-                let ok = self.lor(fib, on);
                 let v = self.read_lane_half(a, l);
-                if bound {
-                    self.sel(ok, v, z)
+                if fi {
+                    v
                 } else {
-                    self.sel(ok, v, cur)
+                    let (el, eh) = self.exec_mask();
+                    let on = self.lanebit_at(el, eh, l);
+                    self.sel(on, v, if bound { z } else { cur })
                 }
             }
             "v_readfirstlane_b32" => {
@@ -1370,6 +1373,66 @@ impl Lw {
             let m = self.bin(BinOp::LShr, all, s);
             let le = self.cmpc(Pred::ULe, l, 32);
             self.selc(le, 0, m)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+
+    fn translate_and_dis(name: &str, enc: &str, fields: &[(&str, u64)]) -> String {
+        let mut code = rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}"));
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        let opts = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, opts).expect("direct translate");
+        validate::validate(&dxil).expect("dxil validate");
+        validate::disassemble(&dxil).expect("dxil disassemble")
+    }
+
+    fn main_insts(dis: &str) -> Vec<&str> {
+        let body = dis.split("define void @main()").nth(1).unwrap_or(dis).split("\n}").next().unwrap_or(dis);
+        body.lines().filter(|l| l.starts_with("  ")).map(|l| l.split(';').next().unwrap_or("").trim()).filter(|l| !l.is_empty()).collect()
+    }
+
+    fn dpp16_mov(ctrl: u64, rm: u64, bm: u64, fi: u64) -> String {
+        translate_and_dis("V_MOV_B32", "VOP1_VOP_DPP16", &[("VDST", 1), ("SRC0", 0xFA), ("VSRC0", 0), ("DPP_CTRL", ctrl), ("ROW_MASK", rm), ("BANK_MASK", bm), ("FI", fi)])
+    }
+
+    #[test]
+    fn dpp16_quad_perm_full_mask_fi1_prunes_redundant_checks() {
+        let (fast, masked) = (dpp16_mov(0xB1, 0xF, 0xF, 1), dpp16_mov(0xB1, 0x5, 0xA, 0));
+        let (fi, mi) = (main_insts(&fast), main_insts(&masked));
+        assert!(!fi.iter().any(|l| l.contains("ashr ") || l.contains("icmp sge ")), "unexpected clamp/ashr:\n{fast}");
+        assert!(!fi.iter().any(|l| l.contains("@dx.op.binary.i32(i32 37,")), "unexpected IMax clamp:\n{fast}");
+        assert!(!fi.iter().any(|l| l.contains("lshr i32 15,")), "unexpected row/bank mask probe:\n{fast}");
+        let (fl, ml) = (fi.iter().filter(|l| l.contains("lshr ")).count(), mi.iter().filter(|l| l.contains("lshr ")).count());
+        assert_eq!((fl, ml), (2, 7), "lshr counts:\n{fast}\n---\n{masked}");
+        assert!(fi.len() + 10 < mi.len(), "expected fewer IR insts ({} vs {}):\n{fast}\n---\n{masked}", fi.len(), mi.len());
+    }
+
+    #[test]
+    fn dpp16_row_shl_masked_fi0_keeps_all_checks() {
+        let dis = dpp16_mov(0x101, 0x5, 0xA, 0);
+        let insts = main_insts(&dis);
+        assert!(insts.iter().any(|l| l.contains("lshr i32 5,")), "missing row_mask probe:\n{dis}");
+        assert!(insts.iter().any(|l| l.contains("lshr i32 10,")), "missing bank_mask probe:\n{dis}");
+        assert!(insts.iter().any(|l| l.contains("icmp ult i32 ") && l.ends_with(", 16")), "missing row_shl bounds check:\n{dis}");
+        let ne_zero = insts.iter().filter(|l| l.contains("icmp ne i32 ") && l.ends_with(", 0")).count();
+        assert_eq!(ne_zero, 4, "expected row + bank + lanebit_at + act() nz checks (got {ne_zero}):\n{dis}");
+    }
+
+    #[test]
+    fn permlane16_fi1_skips_lanebit_at() {
+        const V: u64 = 256;
+        for op in ["V_PERMLANE16_B32", "V_PERMLANEX16_B32"] {
+            let dis_fi1 = translate_and_dis(op, "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 2), ("SRC2", 3), ("OP_SEL", 1)]);
+            let dis_fi0 = translate_and_dis(op, "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 2), ("SRC2", 3), ("OP_SEL", 0)]);
+            let (i1, i0) = (main_insts(&dis_fi1), main_insts(&dis_fi0));
+            let (l1, l0) = (i1.iter().filter(|l| l.contains("lshr ")).count(), i0.iter().filter(|l| l.contains("lshr ")).count());
+            assert_eq!(l1 + 1, l0, "{op} fi=1 should skip lanebit_at lshr ({l1} vs {l0}):\n{dis_fi1}\n---\n{dis_fi0}");
+            assert!(i1.len() + 4 <= i0.len(), "{op} fi=1 should emit fewer insts ({} vs {}):\n{dis_fi1}\n---\n{dis_fi0}", i1.len(), i0.len());
         }
     }
 }
