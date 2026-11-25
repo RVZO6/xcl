@@ -831,9 +831,22 @@ impl Lw {
             }
             "v_lerp_u8" => self.lerp_u8(a, b, c),
             "v_add_nc_i32" | "v_sub_nc_i32" if m.clamp => {
-                let (x, y) = (self.sext64(a), self.sext64(b));
-                let r = if name == "v_add_nc_i32" { self.add(x, y) } else { self.sub(x, y) };
-                self.sat_i32(r)
+                let (r, ovf_bits) = if name == "v_add_nc_i32" {
+                    let r = self.add(a, b);
+                    let xa = self.xor(r, a);
+                    let xb = self.xor(r, b);
+                    (r, self.and(xa, xb))
+                } else {
+                    let r = self.sub(a, b);
+                    let xab = self.xor(a, b);
+                    let xra = self.xor(r, a);
+                    (r, self.and(xab, xra))
+                };
+                let ovf = self.cmpc(Pred::SLt, ovf_bits, 0);
+                let neg = self.cmpc(Pred::SLt, r, 0);
+                let min = self.c(0x8000_0000);
+                let sat = self.selc(neg, 0x7FFF_FFFF, min);
+                self.sel(ovf, sat, r)
             }
             "v_add_nc_i32" => self.add(a, b),
             "v_sub_nc_i32" => self.sub(a, b),
@@ -1037,16 +1050,19 @@ impl Lw {
                 let cb = self.lane_of(l, h);
                 let cin = self.u(cb);
                 let (x, y) = if name == "v_subrev_co_ci_u32" { (b, a) } else { (a, b) };
-                let (x6, y6, c6) = (self.zext64(x), self.zext64(y), self.zext64(cin));
-                let w = if name == "v_add_co_ci_u32" {
-                    let s = self.add(x6, y6);
-                    self.add(s, c6)
+                let (t, carry) = if name == "v_add_co_ci_u32" {
+                    let s1 = self.add(x, y);
+                    let c1 = self.cmp(Pred::ULt, s1, x);
+                    let t = self.add(s1, cin);
+                    let c2 = self.cmp(Pred::ULt, t, s1);
+                    (t, self.lor(c1, c2))
                 } else {
-                    let s = self.sub(x6, y6);
-                    self.sub(s, c6)
+                    let s1 = self.sub(x, y);
+                    let b1 = self.cmp(Pred::UGt, y, x);
+                    let t = self.sub(s1, cin);
+                    let b2 = self.cmp(Pred::ULt, s1, cin);
+                    (t, self.lor(b1, b2))
                 };
-                let (t, hi) = self.unpack64(w);
-                let carry = self.nz(hi);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::S(106));
                 self.write_mask(&sdst, carry);
                 self.vwrite(d, &dst, t);

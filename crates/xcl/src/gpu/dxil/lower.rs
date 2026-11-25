@@ -1786,11 +1786,7 @@ impl Lw {
     // ------------------------------------------------------------ helpers (PRELUDE)
 
     pub fn mul_hi(&mut self, a: Value, b: Value, signed: bool) -> Value {
-        let (x, y) = if signed { (self.sext64(a), self.sext64(b)) } else { (self.zext64(a), self.zext64(b)) };
-        let p = self.mul(x, y);
-        let k = self.c64(32);
-        let h = self.bin(BinOp::LShr, p, k);
-        self.trunc32(h)
+        if signed { self.s.imul_hi(a, b) } else { self.s.umul_hi(a, b) }
     }
     pub fn bfm(&mut self, a: Value, b: Value) -> Value {
         let w = self.andc(a, 31);
@@ -1804,11 +1800,7 @@ impl Lw {
         self.shl(m, b)
     }
     pub fn ffbh_i(&mut self, v: Value) -> Value {
-        let z = self.c(0);
-        let neg = self.cmp(Pred::SLt, v, z);
-        let n = self.not(v);
-        let x = self.sel(neg, n, v);
-        self.lzcnt(x)
+        self.s.bit_count(BitCount::FirstbitSHi, v)
     }
     pub fn sbfe_u(&mut self, v: Value, c: Value) -> Value {
         let o = self.andc(c, 31);
@@ -1844,27 +1836,12 @@ impl Lw {
     pub fn bfe_u(&mut self, v: Value, o: Value, w: Value) -> Value {
         let o = self.andc(o, 31);
         let w = self.andc(w, 31);
-        let x = self.bin(BinOp::LShr, v, o);
-        let k = self.c(32);
-        let s = self.sub(k, w);
-        let s = self.andc(s, 31);
-        let all = self.c(u32::MAX);
-        let m = self.bin(BinOp::LShr, all, s);
-        let r = self.and(x, m);
-        let wz = self.cmpc(Pred::Eq, w, 0);
-        self.selc(wz, 0, r)
+        self.s.tertiary(Tertiary::Ubfe, w, o, v)
     }
     pub fn bfe_i(&mut self, v: Value, o: Value, w: Value) -> Value {
         let o = self.andc(o, 31);
         let w = self.andc(w, 31);
-        let k = self.c(32);
-        let s = self.sub(k, w);
-        let s = self.andc(s, 31);
-        let x = self.bin(BinOp::AShr, v, o);
-        let y = self.bin(BinOp::Shl, x, s);
-        let y = self.bin(BinOp::AShr, y, s);
-        let wz = self.cmpc(Pred::Eq, w, 0);
-        self.selc(wz, 0, y)
+        self.s.tertiary(Tertiary::Ibfe, w, o, v)
     }
     pub fn wqm(&mut self, m: Value) -> Value {
         let a = self.lshrc(m, 1);
@@ -2064,4 +2041,157 @@ fn fold_bin(op: BinOp, x: u64, y: u64, w: u32) -> Option<u64> {
         BinOp::URem if y != 0 => x % y,
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+
+    fn asm(list: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in list {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    #[test]
+    fn lower_32bit_native_ops_avoid_i64() {
+        const V: u64 = 256;
+        let code = asm(&[
+            ("S_MUL_HI_U32", "ENC_SOP2", &[("SDST", 2), ("SSRC0", 0), ("SSRC1", 1)]),
+            ("S_MUL_HI_I32", "ENC_SOP2", &[("SDST", 3), ("SSRC0", 0), ("SSRC1", 1)]),
+            ("V_MUL_HI_U32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1)]),
+            ("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 11), ("SRC0", V), ("SRC1", V + 1)]),
+            ("V_ADD_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 12), ("SDST", 20), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 22)]),
+            ("V_SUB_CO_CI_U32", "VOP3_SDST_ENC", &[("VDST", 13), ("SDST", 24), ("SRC0", V), ("SRC1", V + 1), ("SRC2", 20)]),
+            ("V_SUBREV_CO_CI_U32", "ENC_VOP2", &[("VDST", 14), ("SRC0", V), ("VSRC1", 1)]),
+            ("V_MAD_U64_U32", "VOP3_SDST_ENC", &[("VDST", 16), ("SDST", 26), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+            ("V_MAD_I64_I32", "VOP3_SDST_ENC", &[("VDST", 18), ("SDST", 28), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+            ("V_ADD_NC_I32", "ENC_VOP3", &[("VDST", 20), ("SRC0", V), ("SRC1", V + 1), ("CLAMP", 1)]),
+            ("V_SUB_NC_I32", "ENC_VOP3", &[("VDST", 21), ("SRC0", V), ("SRC1", V + 1), ("CLAMP", 1)]),
+            ("S_FLBIT_I32", "ENC_SOP1", &[("SDST", 4), ("SSRC0", 0)]),
+            ("V_FFBH_I32", "ENC_VOP1", &[("VDST", 22), ("SRC0", V)]),
+            ("V_BFE_U32", "ENC_VOP3", &[("VDST", 23), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+            ("V_BFE_I32", "ENC_VOP3", &[("VDST", 24), ("SRC0", V), ("SRC1", V + 1), ("SRC2", V + 2)]),
+        ]);
+        let opts = kernel::KernelOptions { wave64: true, split: false, mem_windows: 1, sampler_base: 0 };
+        let dxil = kernel::translate(&code, opts).expect("direct translate");
+        validate::validate(&dxil).expect("dxil validate");
+        let dis = validate::disassemble(&dxil).expect("dxil disassemble");
+        assert!(!dis.contains("64-bit integers"), "must not require Int64Ops:\n{dis}");
+        let body = dis.split("define void @main()").nth(1).unwrap_or(&dis).split("\n}\n").next().unwrap_or(&dis);
+        assert!(!body.contains(" i64 "), "must not emit i64 ops in @main:\n{body}");
+        for needle in [
+            "@dx.op.binaryWithTwoOuts.i32(i32 41,",
+            "@dx.op.binaryWithTwoOuts.i32(i32 42,",
+            "@dx.op.unaryBits.i32(i32 34,",
+            "@dx.op.tertiary.i32(i32 51,",
+            "@dx.op.tertiary.i32(i32 52,",
+        ] {
+            assert!(dis.contains(needle), "missing {needle}:\n{dis}");
+        }
+        let mul_only = asm(&[("V_MUL_HI_I32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V), ("SRC1", V + 1)])]);
+        let mul_dxil = kernel::translate(&mul_only, opts).expect("mul_hi translate");
+        validate::validate(&mul_dxil).expect("mul_hi validate");
+        let mul_dis = validate::disassemble(&mul_dxil).expect("mul_hi disassemble");
+        assert!(!mul_dis.contains("64-bit integers") && mul_dis.contains("@dx.op.binaryWithTwoOuts.i32(i32 41,"));
+        assert!(!mul_dis.lines().any(|l| l.contains("extractvalue %dx.types.twoi32") && l.trim_end().ends_with(", 1")));
+    }
+
+    #[test]
+    fn carry_borrow_32bit_matches_i64_ref() {
+        let vals = [0u32, 1, 2, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF, 0x8765_4321];
+        for &a in &vals {
+            for &b in &vals {
+                for cin in [0u32, 1] {
+                    let s1 = a.wrapping_add(b);
+                    let t = s1.wrapping_add(cin);
+                    let carry = (s1 < a) || (t < s1);
+                    let w = (a as u64) + (b as u64) + (cin as u64);
+                    assert_eq!((t, carry), (w as u32, (w >> 32) != 0), "add_co_ci({a:#x}, {b:#x}, {cin})");
+                    for (x, y) in [(a, b), (b, a)] {
+                        let s1 = x.wrapping_sub(y);
+                        let t = s1.wrapping_sub(cin);
+                        let borrow = (y > x) || (s1 < cin);
+                        let w = (x as u64).wrapping_sub(y as u64).wrapping_sub(cin as u64);
+                        assert_eq!((t, borrow), (w as u32, (w >> 32) != 0), "sub_co_ci({x:#x}, {y:#x}, {cin})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mad_64_32_matches_i64_ref() {
+        let ab = [0u32, 1, 2, 0xFFFF, 0x1_0000, 0x7FFF_FFFF, 0x8000_0000, 0x8000_0001, 0xFFFF_FFFE, 0xFFFF_FFFF];
+        let cs = [0u32, 1, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF];
+        for signed in [false, true] {
+            for &a in &ab {
+                for &b in &ab {
+                    let p = if signed { ((a as i32 as i64) * (b as i32 as i64)) as u64 } else { (a as u64) * (b as u64) };
+                    let (p_lo, p_hi) = (p as u32, (p >> 32) as u32);
+                    for &c_lo in &cs {
+                        for &c_hi in &cs {
+                            let lo = p_lo.wrapping_add(c_lo);
+                            let c0 = lo < c_lo;
+                            let hi1 = p_hi.wrapping_add(c_hi);
+                            let c1 = hi1 < c_hi;
+                            let hi = hi1.wrapping_add(c0 as u32);
+                            let c2 = hi < hi1;
+                            let carry = c1 || c2;
+                            let c = (c_lo as u64) | ((c_hi as u64) << 32);
+                            let w = p.wrapping_add(c);
+                            assert_eq!((lo, hi, carry), (w as u32, (w >> 32) as u32, w < c), "mad(signed={signed}, {a:#x}, {b:#x}, {c:#x})");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn signed_sat_add_sub_32bit_matches_i64_ref() {
+        let vals = [i32::MIN, i32::MIN + 1, -0x4000_0000, -2, -1, 0, 1, 2, 0x4000_0000, i32::MAX - 1, i32::MAX];
+        for &ai in &vals {
+            for &bi in &vals {
+                let (a, b) = (ai as u32, bi as u32);
+                let r = a.wrapping_add(b);
+                let ovf = (((r ^ a) & (r ^ b)) as i32) < 0;
+                let sat = if (r as i32) < 0 { 0x7FFF_FFFFu32 } else { 0x8000_0000u32 };
+                let want = (ai as i64 + bi as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32;
+                assert_eq!(if ovf { sat } else { r }, want, "sat_add({ai}, {bi})");
+                let r = a.wrapping_sub(b);
+                let ovf = (((a ^ b) & (r ^ a)) as i32) < 0;
+                let sat = if (r as i32) < 0 { 0x7FFF_FFFFu32 } else { 0x8000_0000u32 };
+                let want = (ai as i64 - bi as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32;
+                assert_eq!(if ovf { sat } else { r }, want, "sat_sub({ai}, {bi})");
+            }
+        }
+    }
+
+    #[test]
+    fn bfe_and_ffbh_i_32bit_matches_ref() {
+        let vals = [0u32, 1, 0x8000, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, 0xFFFF_FFFF, 0xA5A5_5A5A, 0x5A5A_A5A5];
+        for &v in &vals {
+            let flipped = if (v as i32) < 0 { !v } else { v };
+            let want_ffbh = if flipped == 0 { u32::MAX } else { flipped.leading_zeros() };
+            let got_ffbh = if v == 0 || v == u32::MAX { u32::MAX } else if (v as i32) < 0 { (!v).leading_zeros() } else { v.leading_zeros() };
+            assert_eq!(got_ffbh, want_ffbh, "ffbh_i({v:#x})");
+            for raw_o in 0u32..=35 {
+                for raw_w in 0u32..=35 {
+                    let (o, w) = (raw_o & 31, raw_w & 31);
+                    let s = 32u32.wrapping_sub(w) & 31;
+                    let want_u = if w == 0 { 0 } else { (v >> o) & (u32::MAX >> s) };
+                    let got_u = if w == 0 { 0 } else if w + o < 32 { (v << (32 - w - o)) >> (32 - w) } else { v >> o };
+                    assert_eq!(got_u, want_u, "bfe_u({v:#x}, {raw_o}, {raw_w})");
+                    let want_i = if w == 0 { 0 } else { ((((v as i32) >> o) << s) >> s) as u32 };
+                    let got_i = if w == 0 { 0 } else if w + o < 32 { (((v << (32 - w - o)) as i32) >> (32 - w)) as u32 } else { ((v as i32) >> o) as u32 };
+                    assert_eq!(got_i, want_i, "bfe_i({v:#x}, {raw_o}, {raw_w})");
+                }
+            }
+        }
+    }
 }
