@@ -408,12 +408,23 @@ impl Lw {
         let x = self.or(lo, hi);
         self.sel(sz, w[0], x)
     }
+    /// One byte (in the low 8 bits; upper bits undefined) from byte address `a`
+    /// (one Load1 in a single window switch, never straddling a dword boundary).
+    fn ld_raw_byte_guarded(&mut self, guard: Option<Value>, a: Value) -> Value {
+        let b = self.andc(a, !3);
+        let s = self.andc(a, 3);
+        let s = self.shlc(s, 3);
+        let w = self.with_mem_i32s(guard, 1, &mut |lw, m| lw.s.raw_load(m, b, 0x1))[0];
+        self.bin(BinOp::LShr, w, s)
+    }
     /// `st_part`: atomically replace the bits `m` of the dword at `b` by `v`.
     fn st_part(&mut self, b: Value, m: Value, v: Value) {
         let nm = self.not(m);
-        self.mraw_atomic(AtomicOp::And, b, nm);
         let vm = self.and(v, m);
-        self.mraw_atomic(AtomicOp::Or, b, vm);
+        self.with_mem_void(None, &mut |lw, mem| {
+            lw.s.raw_atomic(mem, AtomicOp::And, b, nm);
+            lw.s.raw_atomic(mem, AtomicOp::Or, b, vm);
+        });
     }
     /// `st_bytes`: store the low `n` bytes of `r` at byte address `a` (n ≤ 16; partial
     /// dwords through atomics so neighbours stay intact).
@@ -426,6 +437,10 @@ impl Lw {
         let nz3 = self.cmpc(Pred::Eq, n3, 0);
         let whole = self.land(sz, nz3);
         self.guarded(whole, &mut |lw| {
+            if let Some(k @ (4 | 8 | 12 | 16)) = lw.s.m.const_u64(n) {
+                lw.mem_st_n(None, b, &r[..(k as usize / 4)]);
+                return Ok(());
+            }
             for k in 0..4u32 {
                 let has = lw.cmpc(Pred::UGt, n, k * 4);
                 let at = lw.addc(b, 4 * k);
@@ -464,16 +479,19 @@ impl Lw {
                     let ms = lw.bin(BinOp::Shl, m, s);
                     let vs = lw.bin(BinOp::Shl, rk, s);
                     lw.st_part(at, ms, vs);
-                    let top = lw.add(s, c8);
-                    let over = lw.cmpc(Pred::UGt, top, 32);
-                    let spill = lw.land(snz, over);
-                    lw.guarded(spill, &mut |lw| {
-                        let at4 = lw.addc(at, 4);
-                        let m2 = lw.bin(BinOp::LShr, m, inv);
-                        let v2 = lw.bin(BinOp::LShr, rk, inv);
-                        lw.st_part(at4, m2, v2);
-                        Ok(())
-                    })
+                    if lw.s.m.const_u64(chunk) != Some(1) {
+                        let top = lw.add(s, c8);
+                        let over = lw.cmpc(Pred::UGt, top, 32);
+                        let spill = lw.land(snz, over);
+                        lw.guarded(spill, &mut |lw| {
+                            let at4 = lw.addc(at, 4);
+                            let m2 = lw.bin(BinOp::LShr, m, inv);
+                            let v2 = lw.bin(BinOp::LShr, rk, inv);
+                            lw.st_part(at4, m2, v2);
+                            Ok(())
+                        })?;
+                    }
+                    Ok(())
                 })?;
             }
             Ok(())
@@ -1188,7 +1206,7 @@ impl Lw {
                 let nv = self.c(n);
                 return self.guarded(c, &mut |lw| lw.st_bytes(a, [data, z, z, z], nv));
             }
-            let r0 = self.ld_raw_u32_guarded(Some(act), a);
+            let r0 = if n == 1 { self.ld_raw_byte_guarded(Some(act), a) } else { self.ld_raw_u32_guarded(Some(act), a) };
             let z = self.c(0);
             let raw = self.sel(ok, r0, z);
             let nv = self.d16_merge(v, raw, n, signed, half);
@@ -1205,7 +1223,7 @@ impl Lw {
                 let nv = self.c(n);
                 return self.guarded(c, &mut |lw| lw.st_bytes(a, [v, z, z, z], nv));
             }
-            let r0 = self.ld_raw_u32_guarded(Some(act), a);
+            let r0 = if n == 1 { self.ld_raw_byte_guarded(Some(act), a) } else { self.ld_raw_u32_guarded(Some(act), a) };
             let bits = 8 * n;
             let val = if signed {
                 let x = self.shlc(r0, 32 - bits);
@@ -1896,7 +1914,7 @@ impl Lw {
             }
             let vd = Self::fv(d, "VDST");
             let v = self.vreg(vd);
-            let r0 = self.ld_raw_u32_guarded(Some(act), a);
+            let r0 = if n == 1 { self.ld_raw_byte_guarded(Some(act), a) } else { self.ld_raw_u32_guarded(Some(act), a) };
             let nv = self.d16_merge(v, r0, n, signed, half);
             self.write32(&Dst::V(vd), nv);
             return Ok(());
@@ -2299,6 +2317,14 @@ impl Lw {
         let sz = self.cmpc(Pred::Eq, s, 0);
         self.sel(sz, lo, xy)
     }
+    fn scr_ld_byte(&mut self, a: Value) -> Value {
+        let b = self.scr_slot(a);
+        let s = self.andc(a, 3);
+        let s = self.shlc(s, 3);
+        let p = self.scratch_ptr(b);
+        let lo = self.s.m.load(p, 4);
+        self.bin(BinOp::LShr, lo, s)
+    }
     fn scr_st(&mut self, a: Value, v: Value, n: u32) -> LResult<()> {
         let b = self.scr_slot(a);
         let s = self.andc(a, 3);
@@ -2313,6 +2339,9 @@ impl Lw {
         let vs = self.bin(BinOp::Shl, vm, s);
         let nv = self.or(keep, vs);
         self.s.m.store(p, nv, 4);
+        if n <= 1 {
+            return Ok(());
+        }
         let snz = self.cmpc(Pred::Ne, s, 0);
         let top = self.addc(s, 8 * n);
         let over = self.cmpc(Pred::UGt, top, 32);
@@ -2352,7 +2381,7 @@ impl Lw {
             let vd = Self::fv(d, "VDST");
             let v = self.vreg(vd);
             return self.guarded(act, &mut |lw| {
-                let raw = lw.scr_ld(a);
+                let raw = if n == 1 { lw.scr_ld_byte(a) } else { lw.scr_ld(a) };
                 let nv = lw.d16_merge(v, raw, n, signed, half);
                 lw.vset(vd, nv);
                 Ok(())
@@ -2522,5 +2551,123 @@ impl Lw {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{kernel, validate};
+    use crate::gpu::rdna2;
+
+    fn prog(ops: &[(&str, &str, &[(&str, u64)])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for &(name, enc, fields) in ops {
+            code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+        }
+        code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+        code
+    }
+
+    fn translate_and_dis(ops: &[(&str, &str, &[(&str, u64)])], mem_windows: u32) -> String {
+        let code = prog(ops);
+        let dxil = kernel::translate(&code, kernel::KernelOptions { wave64: false, split: false, mem_windows, sampler_base: 0 })
+            .unwrap_or_else(|e| panic!("translate (w={mem_windows}): {e}"));
+        validate::validate(&dxil).unwrap_or_else(|e| panic!("validate (w={mem_windows}): {e}"));
+        validate::disassemble(&dxil).unwrap_or_else(|e| panic!("disassemble (w={mem_windows}): {e}"))
+    }
+
+    fn main_lines(dis: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut in_fn = false;
+        for line in dis.lines() {
+            let t = line.trim();
+            if t.starts_with("define ") {
+                in_fn = true;
+            } else if in_fn && t == "}" {
+                break;
+            } else if in_fn {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn byte_stores_fuse_st_part_and_skip_spill() {
+        let cases: &[(&str, &[(&str, &str, &[(&str, u64)])])] = &[
+            ("global_store_byte", &[("GLOBAL_STORE_BYTE", "ENC_FLAT_GLBL", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7D), ("OFFSET", 0)])]),
+            ("buffer_store_byte", &[("BUFFER_STORE_BYTE", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)])]),
+        ];
+        for &(label, ops) in cases {
+            for mem_windows in [1u32, 4] {
+                let dis = translate_and_dis(ops, mem_windows);
+                let lines = main_lines(&dis);
+                let switches = lines.iter().filter(|l| l.starts_with("switch ")).count();
+                let atomics = lines.iter().filter(|l| l.contains("call ") && l.contains("@dx.op.atomicBinOp.")).count();
+                let want_switches = usize::from(mem_windows > 1);
+                let want_atomics = (mem_windows * 2) as usize;
+                assert_eq!(switches, want_switches, "{label} (w={mem_windows}) expected {want_switches} switch:\n{dis}");
+                assert_eq!(atomics, want_atomics, "{label} (w={mem_windows}) expected {want_atomics} atomicBinOp calls:\n{dis}");
+            }
+        }
+    }
+
+    #[test]
+    fn byte_loads_use_single_dword_mask() {
+        let cases: &[(&str, bool, &[(&str, &str, &[(&str, u64)])])] = &[
+            ("global_load_ubyte", false, &[("GLOBAL_LOAD_UBYTE", "ENC_FLAT_GLBL", &[("VDST", 2), ("ADDR", 0), ("SADDR", 0x7D), ("OFFSET", 0)])]),
+            ("buffer_load_sbyte", true, &[("BUFFER_LOAD_SBYTE", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)])]),
+            ("buffer_load_sbyte_d16_hi", true, &[("BUFFER_LOAD_SBYTE_D16_HI", "ENC_MUBUF", &[("VDATA", 2), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1)])]),
+        ];
+        for &(label, signed, ops) in cases {
+            for mem_windows in [1u32, 4] {
+                let dis = translate_and_dis(ops, mem_windows);
+                let lines = main_lines(&dis);
+                let switches = lines.iter().filter(|l| l.starts_with("switch ")).count();
+                let want_switches = usize::from(mem_windows > 1);
+                assert_eq!(switches, want_switches, "{label} (w={mem_windows}) expected {want_switches} switch:\n{dis}");
+                let raw_loads: Vec<&&str> = lines.iter().filter(|l| l.contains("call ") && l.contains("@dx.op.rawBufferLoad.")).collect();
+                assert!(raw_loads.len() >= mem_windows as usize, "{label} (w={mem_windows}) missing rawBufferLoad:\n{dis}");
+                assert!(raw_loads.iter().all(|l| l.contains(", i8 1, i32 4)")), "{label} (w={mem_windows}) expected mask i8 1:\n{dis}");
+                assert!(!raw_loads.iter().any(|l| l.contains(", i8 3,")), "{label} (w={mem_windows}) unexpected mask i8 3:\n{dis}");
+                if signed {
+                    assert!(lines.iter().any(|l| l.contains("ashr i32 ") && l.contains(", 24")), "{label} missing sbyte sign-extension:\n{dis}");
+                } else {
+                    assert!(lines.iter().any(|l| l.contains("and i32 ") && l.contains(", 255")), "{label} missing ubyte mask:\n{dis}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scratch_byte_ops_are_single_dword() {
+        for mem_windows in [1u32, 4] {
+            let dis_st = translate_and_dis(&[("SCRATCH_STORE_BYTE", "ENC_FLAT_SCRATCH", &[("ADDR", 0), ("DATA", 2), ("SADDR", 0x7F), ("OFFSET", 0)])], mem_windows);
+            let st_lines = main_lines(&dis_st);
+            let st_loads = st_lines.iter().filter(|l| l.starts_with("load ") || l.contains("= load ")).count();
+            let st_stores = st_lines.iter().filter(|l| l.starts_with("store ")).count();
+            assert_eq!((st_loads, st_stores), (1, 1), "scratch_store_byte (w={mem_windows}) expected 1 load + 1 store:\n{dis_st}");
+
+            let dis_ld = translate_and_dis(&[("SCRATCH_LOAD_UBYTE", "ENC_FLAT_SCRATCH", &[("VDST", 2), ("ADDR", 0), ("SADDR", 0x7F), ("OFFSET", 0)])], mem_windows);
+            let ld_lines = main_lines(&dis_ld);
+            let ld_loads = ld_lines.iter().filter(|l| l.starts_with("load ") || l.contains("= load ")).count();
+            let ld_stores = ld_lines.iter().filter(|l| l.starts_with("store ")).count();
+            assert_eq!((ld_loads, ld_stores), (1, 0), "scratch_load_ubyte (w={mem_windows}) expected 1 load + 0 stores:\n{dis_ld}");
+            assert!(ld_lines.iter().any(|l| l.contains("and i32 ") && l.contains(", 255")), "scratch_load_ubyte missing ubyte mask:\n{dis_ld}");
+        }
+    }
+
+    #[test]
+    fn st_bytes_const_whole_uses_vector_raw_store() {
+        let ops: &[(&str, &str, &[(&str, u64)])] = &[("TBUFFER_STORE_FORMAT_XYZW", "ENC_MTBUF", &[("VDATA", 4), ("VADDR", 0), ("SRSRC", 1), ("SOFFSET", 128), ("OFFEN", 1), ("FORMAT", 77)])];
+        for mem_windows in [1u32, 4] {
+            let dis = translate_and_dis(ops, mem_windows);
+            let lines = main_lines(&dis);
+            let vec_stores = lines
+                .iter()
+                .filter(|l| l.contains("call ") && l.contains("@dx.op.rawBufferStore.") && l.contains(", i8 15, i32 4)"))
+                .count();
+            assert_eq!(vec_stores, mem_windows as usize, "expected {mem_windows} vector rawBufferStore (i8 15):\n{dis}");
+        }
     }
 }
