@@ -742,13 +742,17 @@ impl Shader {
 // --------------------------------------------------------------- textures
 
 impl Shader {
+    /// Annotates an existing descriptor-heap handle `h` as a typed texture.
+    pub fn annotate_texture(&mut self, h: Value, kind: TexKind, uav: bool, comp: CompType, ncomp: u32) -> Texture {
+        assert!(!(uav && matches!(kind, TexKind::D2MS | TexKind::D2MSArray)), "RWTexture2DMS needs SM 6.7");
+        let handle = self.annotate(h, kind as u32 | if uav { 0x1000 } else { 0 }, typed_props(comp, ncomp));
+        Texture { handle, kind, uav, comp }
+    }
     /// A texture from `ResourceDescriptorHeap[index]` with `ncomp`
     /// components of `comp` (`Texture2D<float4>` = `(D2, false, F32, 4)`).
     pub fn heap_texture(&mut self, index: Value, kind: TexKind, uav: bool, comp: CompType, ncomp: u32, nonuniform: bool) -> Texture {
-        assert!(!(uav && matches!(kind, TexKind::D2MS | TexKind::D2MSArray)), "RWTexture2DMS needs SM 6.7");
         let h = self.handle_from_heap(index, false, nonuniform);
-        let handle = self.annotate(h, kind as u32 | if uav { 0x1000 } else { 0 }, typed_props(comp, ncomp));
-        Texture { handle, kind, uav, comp }
+        self.annotate_texture(h, kind, uav, comp, ncomp)
     }
     /// A sampler from `SamplerDescriptorHeap[index]`.
     pub fn heap_sampler(&mut self, index: Value, comparison: bool, nonuniform: bool) -> Sampler {
