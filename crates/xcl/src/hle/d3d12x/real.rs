@@ -5977,7 +5977,10 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        super::alloc_pool::forget(this as usize);
+        let gone = super::alloc_pool::forget(this as usize);
+        let all: Vec<usize> = gone.free.iter().copied().chain(gone.busy.iter().map(|(b, _)| *b)).collect();
+        super::bind::on_allocator_release(&all);
+        super::console_list::retire_backings(&gone.free, gone.busy);
         super::list_x::on_allocator_release(this as usize);
     }
     n
@@ -5992,13 +5995,13 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
-        None => reset_pc_allocator(this),
-    };
+    let res = super::alloc_pool::title_reset_with_backing(this);
+    let hr = res.hr.unwrap_or_else(|| reset_pc_allocator(this));
     if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
+        if let Some(b) = res.reset_backing {
+            // the GPU is done with what lists recorded on the reset PC backing used
+            super::console_list::allocator_reset(b as *mut c_void);
+        }
     }
     hr
 }
