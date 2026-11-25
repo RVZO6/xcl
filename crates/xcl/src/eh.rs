@@ -253,6 +253,7 @@ fn is_writable(va: usize, bytes: usize) -> bool {
     if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
         return true;
     }
+    crate::hle::kernelx::lazy::ensure(va, bytes);
     let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let found = unsafe { VirtualQuery(va as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } != 0;
     found
@@ -1149,6 +1150,19 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn is_writable_commits_lazy_page_for_clzero() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE};
+        unsafe {
+            let (r, ro) = (VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE, PAGE_READWRITE) as usize, VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE, PAGE_READWRITE) as usize);
+            crate::hle::kernelx::lazy::mark(r);
+            crate::hle::kernelx::lazy::mark_protect(ro, PAGE_READONLY);
+            assert!(is_writable(r + 0x40, 64) && !crate::hle::kernelx::lazy::is_lazy(r) && !is_writable(ro, 64));
+            std::ptr::write_bytes((r + 0x40) as *mut u8, 0, 64);
+            for p in [r, ro] { VirtualFree(p as *mut _, 0, MEM_RELEASE); }
         }
     }
 }
