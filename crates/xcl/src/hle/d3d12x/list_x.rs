@@ -810,6 +810,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::alloc_pool::forget_list(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -2561,18 +2562,26 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         if reset_hr >= 0 {
             reset_copy_scratch(spare);
             next_pc = Some(spare);
+        } else {
+            super::title_list::release_failed_spare(spare);
         }
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
-                return None;
+        None => {
+            let backing = super::alloc_pool::current(alloc);
+            match real::create_raw_pc_command_list(dev.as_raw(), ty, backing, init_pso) {
+                Some(p) => {
+                    super::alloc_pool::created_on_backing(p as usize, alloc, backing, ty.0);
+                    p
+                }
+                None => {
+                    static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+                    warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
+                    return None;
+                }
             }
-        },
+        }
     };
 
     let old_next = {

@@ -126,6 +126,18 @@ pub fn created_on(list: usize, raw: usize, ty: i32) {
     move_list(s, list, raw);
 }
 
+/// `list` (of type `ty`) was made recording on `backing`, the PC allocator currently standing
+/// for the title's allocator `alloc` (e.g. a freshly created mid-list split segment).
+pub fn created_on_backing(list: usize, alloc: usize, backing: usize, ty: i32) {
+    if !enabled() || alloc == 0 || backing == 0 {
+        return;
+    }
+    let mut g = STATE.lock().unwrap();
+    let s = g.get_or_insert_with(State::default);
+    s.types.entry(alloc).or_insert(ty);
+    move_list(s, list, backing);
+}
+
 /// `lists` were just submitted to `queue`.
 pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     if !enabled() || queue.is_null() {
@@ -366,6 +378,77 @@ mod tests {
         assert!(pending_still_held, "final list Release must retain the submitted-work fence");
         assert!(reusable, "a released list cannot keep a completed backing busy");
         assert_eq!(fence.releases.get(), 1);
+    }
+
+    #[test]
+    fn reclaimed_split_segment_releases_alloc_pool_backing_while_preserving_gpu_marks() {
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+        #[repr(C)]
+        struct Fence { vt: *const usize, val: Cell<u64>, rels: Cell<u32> }
+        unsafe extern "system" fn done(p: *mut c_void) -> u64 { (*p.cast::<Fence>()).val.get() }
+        unsafe extern "system" fn rel(p: *mut c_void) -> u32 { let f = &*p.cast::<Fence>(); f.rels.set(f.rels.get() + 1); 0 }
+        extern "system" fn bad() { std::process::abort(); }
+        const SLOT: usize = size_of::<usize>();
+        let mut vt = [bad as usize; size_of::<ID3D12Fence_Vtbl>() / SLOT];
+        vt[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / SLOT] = done as usize;
+        vt[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / SLOT] = rel as usize;
+        let mut fence = Fence { vt: vt.as_ptr(), val: Cell::new(0), rels: Cell::new(0) };
+        let mut ids = Box::new([0u8; 2]);
+        let (alloc, seg) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1);
+        created_on_backing(seg, alloc, alloc, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        {
+            let mut g = STATE.lock().unwrap();
+            let f = unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) };
+            g.as_mut().unwrap().backings.get_mut(&alloc).unwrap().marks.insert(1, (f, 9));
+        }
+        super::super::list_x::clear_segment_state(seg);
+        let cleared_gpu_busy = {
+            let g = STATE.lock().unwrap();
+            let s = g.as_ref().unwrap();
+            !s.of_list.contains_key(&seg) && s.backings[&alloc].users.is_empty()
+                && s.backings[&alloc].marks.len() == 1 && !unsafe { s.backings[&alloc].free() }
+        };
+        fence.val.set(9);
+        let reusable = unsafe { STATE.lock().unwrap().as_ref().unwrap().backings[&alloc].free() };
+        unsafe { forget(alloc) };
+        assert!(cleared_gpu_busy, "reclaimed split segment must drop user pin while keeping GPU marks");
+        assert!(reusable, "once GPU finishes, reclaimed split segment must not pin backing");
+        assert_eq!(fence.rels.get(), 1);
+    }
+
+    #[test]
+    fn fresh_split_segment_on_swapped_backing_pins_backing_under_title_allocator_type() {
+        let mut ids = Box::new([0u8; 4]);
+        let alloc = ids.as_mut_ptr() as usize;
+        let (swapped, seg, spare, ty) = (alloc + 1, alloc + 2, alloc + 3, D3D12_COMMAND_LIST_TYPE_COMPUTE.0);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.cur.insert(alloc, swapped);
+            s.aside.insert(alloc, vec![spare]);
+            s.backings.insert(spare, Backing::default());
+        }
+        assert_eq!(current(alloc), swapped);
+        created_on_backing(seg, alloc, swapped, ty);
+        created_on_backing(seg, 0, swapped, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        created_on_backing(seg, alloc, 0, D3D12_COMMAND_LIST_TYPE_DIRECT.0);
+        let mut calls = Vec::new();
+        let (pinned, typed, hr, cur_after, aside_swapped) = {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let pinned = s.of_list.get(&seg) == Some(&swapped)
+                && s.backings.get(&swapped).is_some_and(|b| b.users.contains(&seg) && !unsafe { b.free() });
+            let typed = s.types.get(&alloc) == Some(&ty) && !s.types.contains_key(&swapped);
+            let hr = unsafe { title_reset_in(s, alloc as *mut c_void, |r| { calls.push(r as usize); 0 }) };
+            let cur_after = s.cur.get(&alloc).copied();
+            let aside_swapped = s.aside.get(&alloc).is_some_and(|v| v.contains(&swapped));
+            for k in [alloc, swapped, spare] { s.cur.remove(&k); s.aside.remove(&k); s.types.remove(&k); s.backings.remove(&k); }
+            s.of_list.remove(&seg);
+            (pinned, typed, hr, cur_after, aside_swapped)
+        };
+        assert!(pinned && typed, "fresh split segment must pin swapped backing under title allocator's type");
+        assert_eq!((hr, calls, cur_after, aside_swapped), (Some(0), vec![spare], Some(spare), true));
     }
 
     /// A list recorded once and submitted again after the title reset its allocator: the
