@@ -111,7 +111,7 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     // the title's inline D3D12.X code writes into the list object: it gets one of the
     // console's shape (`title_list`)
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
-        super::bind::reset(*ppv, alloc, pso);
+        super::bind::reset(*ppv, super::alloc_pool::backing_of(*ppv as usize, alloc), pso);
         *ppv = super::title_list::wrap(*ppv);
     }
     hr

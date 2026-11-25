@@ -128,6 +128,14 @@ pub(super) fn forget(list: *mut c_void) {
     }
 }
 
+/// Clear released backing keys from live lists so later resets route UMA blocks to `0`.
+pub(super) fn on_allocator_release(backings: &[usize]) {
+    if backings.is_empty() { return; }
+    if let Some(m) = STATES.lock().unwrap().as_mut() {
+        for s in m.values_mut() { if s.allocator != 0 && backings.contains(&s.allocator) { s.allocator = 0; } }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso: usize, uma: Vec<usize>) {
     with(list, |s| {
@@ -253,23 +261,22 @@ fn signature_dispatches(sig: usize) -> bool {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
-    let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
-    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
-    if !gfx && !compute {
-        // A pipeline still being built (or whose build failed): its stand-in draws nothing, and
-        // the list may hold XCL's ABI root signature from a translated draw before it – the PC
-        // call with that pair is invalid (debug layer 953, "the currently set Root Signature
-        // doesn't match the currently set Pipeline State Object"; a retail title's world then
-        // hung the GPU, 0x887a0006). Skipped, like a draw or dispatch of such a pipeline.
-        if super::pso_async::is_pending(with(this, |s| s.pso)) {
-            count(DRAWS_SKIPPED);
+    let pso = match super::pso_async::resolve_wait_checked(with(this, |s| s.pso)) {
+        super::pso_async::ResolveOutcome::Ready(pso) | super::pso_async::ResolveOutcome::Untracked(pso) => pso,
+        outcome @ (super::pso_async::ResolveOutcome::Pending | super::pso_async::ResolveOutcome::Failed) => {
+            // Stand-in pending/failed: skip to avoid pairing it with XCL's ABI RS (debug 953 / GPU hang 0x887a0006).
+            count(if signature_dispatches(sig) { DISPATCHES_SKIPPED } else { DRAWS_SKIPPED });
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
-                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that is still being built skipped");
+                let why = if matches!(outcome, super::pso_async::ResolveOutcome::Pending) { "is still being built" } else { "failed to build" };
+                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a pipeline that {why} skipped");
             }
             return;
         }
+    };
+    let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    if !gfx && !compute {
         // a console compute program without a translation (its build failed): nothing to run,
         // as for Dispatch. The PC call would run it with the list's compute root signature, which
         // can still be XCL's ABI one from a translated dispatch before it (debug layer 953).
@@ -297,7 +304,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
-    match bind_abi(this, list, pso, gfx) {
+    match bind_abi_resolved(this, list, pso, gfx) {
         Ok(()) => {
             count(if gfx { DRAWS } else { DISPATCHES });
             fresh_indirect_arguments(this, || pc(this, sig, max, args, args_off, count_buf, count_off))
@@ -934,7 +941,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     if super::present::trace_frame() {
         trace_fullscreen(this, pso, [x, y, z]);
     }
-    bind_abi(this, list, pso, false)?;
+    bind_abi_resolved(this, list, pso, false)?;
     list.Dispatch(x, y, z);
     Ok(())
 }
@@ -943,6 +950,11 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
 /// arguments the console's way – compute or graphics) and the argument table in unified
 /// memory, u1 res, u2… the memory windows; then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    // a pipeline still being built in the background is waited for
+    bind_abi_resolved(this, list, super::pso_async::resolve_wait(pso), gfx)
+}
+
+unsafe fn bind_abi_resolved(this: *mut c_void, list: &ID3D12GraphicsCommandList, real: usize, gfx: bool) -> Result<(), String> {
     super::list_x::ensure_view_heap(this);
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
@@ -954,8 +966,6 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
     // a compute shader takes no more arguments from registers than it has (`inline_for`)
     let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
     let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
@@ -1397,22 +1407,24 @@ void main(uint t : SV_GroupIndex) {
         assert_eq!(fake.set_pso_calls.load(Ordering::Relaxed), 0);
         assert_eq!(
             fake.execute_indirect_calls.load(Ordering::Relaxed),
-            1,
-            "failed async compute stand-in must not enter translated ExecuteIndirect path"
+            0,
+            "failed async compute stand-in must skip ExecuteIndirect instead of calling PC or bind_abi"
         );
 
-        // 3. The same failed stand-in (made from a console shader) with a Dispatch signature:
+        // 3. The same failed fallback (made from a console shader) with a Dispatch signature:
         // nothing to run, as for Dispatch – the PC call would pair the stand-in with the list's
         // compute root signature (XCL's ABI one after a translated dispatch: debug layer 953)
         let sig_dispatch = 0x7200_00F8usize;
-        real::register_console_compute_for_test(standin_fail);
+        let console_fallback = 0x7200_0005usize;
+        real::register_console_compute_for_test(console_fallback);
         note_signature_dispatches(sig_dispatch, true);
+        reset(list_ptr, 0x7200_0100, console_fallback);
         let before = counts_snapshot();
         unsafe {
             execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
         }
         let after = counts_snapshot();
-        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1, "a dispatch of an untranslated console compute pipeline must not reach the PC ExecuteIndirect");
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0, "a dispatch of an untranslated console compute pipeline must not reach the PC ExecuteIndirect");
         assert!(after[DISPATCHES_SKIPPED] > before[DISPATCHES_SKIPPED]);
 
         // 4. A native PC compute pipeline (not made from a console shader) with the same Dispatch
@@ -1422,22 +1434,58 @@ void main(uint t : SV_GroupIndex) {
         unsafe {
             execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
         }
-        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 2, "a native PC compute pipeline must still reach the PC ExecuteIndirect");
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1, "a native PC compute pipeline must still reach the PC ExecuteIndirect");
 
         // a signature made later at the same address without a Dispatch argument goes to the PC
-        reset(list_ptr, 0x7200_0100, standin_fail);
+        reset(list_ptr, 0x7200_0100, console_fallback);
         note_signature_dispatches(sig_dispatch, false);
         unsafe {
             execute_indirect(list_ptr, sig_dispatch, 1, 0, 0, 0, 0);
         }
-        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 3);
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 2);
 
         forget(list_ptr);
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
-        real::forget_pso_for_test(standin_fail);
-        assert!(!real::is_console_compute(standin_fail), "a released pipeline's address does not stay a console one");
+        real::forget_pso_for_test(console_fallback);
+        assert!(!real::is_console_compute(console_fallback), "a released pipeline's address does not stay a console one");
+    }
+
+    #[test]
+    fn execute_indirect_skips_failed_and_pending_standin_without_calling_pc() {
+        let mut orig_vt = [0usize; 64];
+        (orig_vt[1], orig_vt[2], orig_vt[59]) = (fake_add_ref as usize, fake_release as usize, fake_execute_indirect as usize);
+        let mut ext_vt = vec![orig_vt.as_ptr() as usize; 65];
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            vt: unsafe { ext_vt.as_ptr().add(1) }, refs: AtomicUsize::new(1), dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0), set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0), execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list_ptr = &*fake as *const FakeAdoptedList as *mut c_void;
+        let (standin_failed, standin_pending, sig_draw, sig_dispatch, alloc) = (0x7400_0001, 0x7400_0002, 0x7400_00F0, 0x7400_00F8, 0x7400_0100);
+        note_signature_dispatches(sig_dispatch, true);
+        let check_skipped = || {
+            for (sig, idx) in [(sig_draw, DRAWS_SKIPPED), (sig_dispatch, DISPATCHES_SKIPPED)] {
+                let before = counts_snapshot();
+                unsafe { execute_indirect(list_ptr, sig, 1, 0, 0, 0, 0) };
+                assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 0);
+                assert!(counts_snapshot()[idx] > before[idx]);
+            }
+        };
+        pso_async::submit_lazy(standin_failed, false, Box::new(|| 0), 0);
+        assert_eq!(pso_async::with_test_wait_budget(None, || pso_async::resolve_wait_checked(standin_failed)), pso_async::ResolveOutcome::Failed);
+        reset(list_ptr, alloc, standin_failed);
+        check_skipped();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        pso_async::submit_lazy(standin_pending, false, Box::new(move || { let _ = go_rx.recv_timeout(std::time::Duration::from_secs(5)); 0 }), 0);
+        reset(list_ptr, alloc, standin_pending);
+        pso_async::with_test_wait_budget(Some(std::time::Duration::from_millis(5)), check_skipped);
+        note_signature_dispatches(sig_dispatch, false);
+        forget(list_ptr);
+        for k in [standin_failed, standin_pending] { let _ = pso_async::released(k); }
+        let _ = go_tx.send(());
     }
 
     #[test]

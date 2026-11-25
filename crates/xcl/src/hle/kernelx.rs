@@ -137,6 +137,23 @@ pub fn sanitize_protect(p: u32) -> u32 {
     }
 }
 
+/// Whether `prot` is a valid Win32 protection for `MEM_PRIVATE` `VirtualAlloc` /
+/// `VirtualProtect` (single base flag, no copy-on-write, no contradictory cache modifiers).
+pub(crate) fn is_valid_private_protect(prot: u32) -> bool {
+    let base = prot & 0xFF;
+    base.is_power_of_two()
+        && base & (mem::PAGE_WRITECOPY | mem::PAGE_EXECUTE_WRITECOPY) == 0
+        && prot & !STD_PROTECT_MASK == 0
+        && prot & (mem::PAGE_NOCACHE | mem::PAGE_WRITECOMBINE) != (mem::PAGE_NOCACHE | mem::PAGE_WRITECOMBINE)
+        && (base != mem::PAGE_NOACCESS
+            || prot & (mem::PAGE_GUARD | mem::PAGE_NOCACHE | mem::PAGE_WRITECOMBINE) == 0)
+}
+
+/// Whether `prot` can stay uncommitted in `kernelx::lazy` until first fault.
+pub(crate) fn is_valid_lazy_protect(prot: u32) -> bool {
+    is_valid_private_protect(prot) && prot & (mem::PAGE_NOACCESS | mem::PAGE_GUARD) == 0
+}
+
 /// Graphics address space the title reserved (no commit) that unified memory had no room for
 /// – where it maps physical pages (a texture streaming pool): base → size. Write-watched, like
 /// unified memory, so textures in it follow CPU writes (`d3d12x::title_textures`).
@@ -403,6 +420,59 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Full `(AllocationBase, total_span)` of the reservation containing `addr`.
+unsafe fn allocation_span(addr: usize) -> Option<(usize, usize)> {
+    let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+    if mem::VirtualQuery(addr as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0
+        || m.State == mem::MEM_FREE
+        || m.RegionSize == 0
+    {
+        return None;
+    }
+    let alloc_base = m.AllocationBase as usize;
+    if alloc_base == 0 {
+        return None;
+    }
+    let mut cur = alloc_base;
+    while mem::VirtualQuery(cur as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0
+        && m.State != mem::MEM_FREE
+        && m.AllocationBase as usize == alloc_base
+        && m.RegionSize > 0
+    {
+        let Some(next) = (m.BaseAddress as usize).checked_add(m.RegionSize).filter(|&n| n > cur) else {
+            break;
+        };
+        cur = next;
+    }
+    let total = cur.saturating_sub(alloc_base);
+    (total > 0).then_some((alloc_base, total))
+}
+
+/// Execute `free_op` while caller holds `AWAY`, atomically clearing overlapping `LAZY` and
+/// `AWAY` tracking when `free_op` succeeds (lock order: `AWAY -> LAZY`).
+fn forget_away_and_lazy_locked(
+    away: Option<&mut Away>,
+    start: usize,
+    len: usize,
+    free_op: impl FnOnce() -> bool,
+) -> bool {
+    let ok = if len > 0 { lazy::unmark_range_if(start, len, free_op) } else { free_op() };
+    if ok && len > 0 {
+        let (lo, hi) = (start & !(PHYS_PAGE - 1), start.saturating_add(len));
+        if let Some(away) = away {
+            let entries: Vec<_> = away.at.range(lo..hi).map(|(&a, &p)| (a, p)).collect();
+            for (at, p) in entries {
+                away.at.remove(&at);
+                if away.page.get(&p) == Some(&at) {
+                    away.page.remove(&p);
+                }
+                note_mapping_at(at);
+            }
+        }
+    }
+    ok
+}
+
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
 /// zeroes them); others to Windows.
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
@@ -438,9 +508,13 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         };
         if n > 0 {
             // sparse first: under its lock, so no copy of CPU writes to video memory reads the
-            // pages while they go (the submit thread's copy faulted on them)
+            // pages while they go (the submit thread's copy faulted on them); hold AWAY across
+            // VirtualFree + forget so concurrent physical-page ops cannot dereference or race
+            let mut away = AWAY.lock().unwrap();
             crate::hle::d3d12x::sparse::decommitted(a, n);
-            if mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) == 0 {
+            if !forget_away_and_lazy_locked(away.as_mut(), a, n, || {
+                mem::VirtualFree(addr, n, mem::MEM_DECOMMIT) != 0
+            }) {
                 return 0;
             }
         }
@@ -459,23 +533,31 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         }
         return 1;
     }
-    let ok = mem::VirtualFree(addr, size, t);
-    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
-        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-        mirrors::released(addr as usize);
+    let (a, release, decommit) = (addr as usize, t & mem::MEM_RELEASE != 0, t & mem::MEM_DECOMMIT != 0);
+    let mut away = AWAY.lock().unwrap();
+    let span = (a != 0 && release != decommit && size == 0).then(|| allocation_span(a)).flatten();
+    let (forget_start, forget_len) = match (span, release, decommit, size) {
+        (Some((alloc_base, total)), true, false, 0) => (alloc_base, total),
+        (Some((alloc_base, total)), false, true, 0) => (a, alloc_base.saturating_add(total).saturating_sub(a)),
+        (_, false, true, len) if a != 0 && len > 0 => (a, len),
+        _ => (0, 0),
+    };
+    let ok = forget_away_and_lazy_locked(away.as_mut(), forget_start, forget_len, || {
+        mem::VirtualFree(addr, size, t) != 0
+    }) as BOOL;
+    drop(away);
+    if ok != 0 && release {
+        let release_base = span.map_or(a, |(alloc_base, _)| alloc_base);
+        if GRAPHICS_RESERVATIONS.lock().unwrap().remove(&release_base).is_some() {
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::released(release_base);
+        }
     }
     ok
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
-    if proc_ == thr::GetCurrentProcess() {
-        let a = addr as usize;
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
-            || (t & 0x8000 != 0 && in_graphics_reservation(a))
-        {
-            return VirtualFree(addr, size, t);
-        }
-    }
+    if is_current_process(proc_) { return VirtualFree(addr, size, t); }
     mem::VirtualFreeEx(proc_, addr, size, t)
 }
 
@@ -484,11 +566,18 @@ pub unsafe extern "system" fn VirtualAllocEx(proc_: HANDLE, addr: *const c_void,
 }
 
 pub unsafe extern "system" fn VirtualProtect(addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtect(addr, size, sanitize_protect(p), old)
+    VirtualProtectEx(thr::GetCurrentProcess(), addr, size, p, old)
 }
 
 pub unsafe extern "system" fn VirtualProtectEx(proc_: HANDLE, addr: *const c_void, size: usize, p: u32, old: *mut u32) -> BOOL {
-    mem::VirtualProtectEx(proc_, addr, size, sanitize_protect(p), old)
+    let prot = sanitize_protect(p);
+    if is_current_process(proc_) && !old.is_null() {
+        if let Some(prev) = lazy::reprotect(addr as usize, size, prot) {
+            *old = prev;
+            return 1;
+        }
+    }
+    mem::VirtualProtectEx(proc_, addr, size, prot, old)
 }
 
 /// XALLOC_ATTRIBUTES bit fields.
@@ -692,11 +781,33 @@ fn is_current_process(process: HANDLE) -> bool {
     process == (-1isize as HANDLE) || process == unsafe { thr::GetCurrentProcess() }
 }
 
+unsafe fn patch_lazy_mbi(addr: usize, mbi: *mut mem::MEMORY_BASIC_INFORMATION) {
+    let m = &mut *mbi;
+    if m.State != mem::MEM_RESERVE {
+        return;
+    }
+    let base = m.BaseAddress as usize;
+    let end = base.saturating_add(m.RegionSize);
+    if let Some((pb, run, prot)) = lazy::query(addr) {
+        m.State = mem::MEM_COMMIT;
+        m.Protect = prot;
+        m.RegionSize = pb.saturating_add(run).min(end).saturating_sub(base);
+    } else if let Some(next_lazy) = lazy::next_after(base, end) {
+        if next_lazy > base && next_lazy < end {
+            m.RegionSize = next_lazy - base;
+        }
+    }
+}
+
 pub unsafe extern "system" fn VirtualQuery(address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
     if let Some(n) = query_committed_window(address, mbi, len) {
         return n;
     }
-    mem::VirtualQuery(address, mbi, len)
+    let n = mem::VirtualQuery(address, mbi, len);
+    if n >= std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>() {
+        patch_lazy_mbi(address as usize, mbi);
+    }
+    n
 }
 
 pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_void, mbi: *mut mem::MEMORY_BASIC_INFORMATION, len: usize) -> usize {
@@ -705,7 +816,11 @@ pub unsafe extern "system" fn VirtualQueryEx(process: HANDLE, address: *const c_
             return n;
         }
     }
-    mem::VirtualQueryEx(process, address, mbi, len)
+    let n = mem::VirtualQueryEx(process, address, mbi, len);
+    if n >= std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>() && is_current_process(process) {
+        patch_lazy_mbi(address as usize, mbi);
+    }
+    n
 }
 
 /// `BOOL XMemVirtualQuery(HANDLE process, const void* address, XMEM_BASIC_INFORMATION* info)`
@@ -725,6 +840,7 @@ pub unsafe extern "system" fn XMemVirtualQuery(process: HANDLE, address: *const 
     if mem::VirtualQueryEx(process, address, mbi, std::mem::size_of::<mem::MEMORY_BASIC_INFORMATION>()) == 0 {
         return 0;
     }
+    if is_current_process(process) { patch_lazy_mbi(address as usize, mbi); }
     const READABLE: u32 = mem::PAGE_READONLY
         | mem::PAGE_READWRITE
         | mem::PAGE_WRITECOPY
@@ -961,6 +1077,88 @@ unsafe fn resolve_physical_pages(away: Option<&Away>, pages: &[usize], offset: u
     Some(addrs)
 }
 
+fn prot_readable(prot: u32) -> bool {
+    const READABLE: u32 = mem::PAGE_READONLY
+        | mem::PAGE_READWRITE
+        | mem::PAGE_WRITECOPY
+        | mem::PAGE_EXECUTE_READ
+        | mem::PAGE_EXECUTE_READWRITE
+        | mem::PAGE_EXECUTE_WRITECOPY;
+    prot & mem::PAGE_GUARD == 0 && prot & READABLE != 0
+}
+
+fn prot_writable(prot: u32) -> bool {
+    const WRITABLE: u32 = mem::PAGE_READWRITE
+        | mem::PAGE_WRITECOPY
+        | mem::PAGE_EXECUTE_READWRITE
+        | mem::PAGE_EXECUTE_WRITECOPY;
+    prot & mem::PAGE_GUARD == 0 && prot & WRITABLE != 0
+}
+
+/// Temporarily elevates Win32 protections on committed sub-regions that deny reads or writes,
+/// restoring every modified sub-region's exact original protection in reverse order on drop.
+#[derive(Default)]
+struct TempProtect {
+    saved: Vec<(usize, usize, u32)>,
+}
+
+impl TempProtect {
+    unsafe fn allow(&mut self, addr: usize, len: usize, write: bool) -> bool {
+        let Some(end) = addr.checked_add(len) else {
+            return false;
+        };
+        let mut cur = addr;
+        while cur < end {
+            let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            if mem::VirtualQuery(cur as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0
+                || m.State != mem::MEM_COMMIT
+                || m.RegionSize == 0
+            {
+                return false;
+            }
+            let reg_end = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+            if reg_end <= cur {
+                return false;
+            }
+            let step_end = reg_end.min(end);
+            let ok = if write { prot_writable(m.Protect) } else { prot_readable(m.Protect) };
+            if !ok {
+                let exec = m.Protect
+                    & (mem::PAGE_EXECUTE
+                        | mem::PAGE_EXECUTE_READ
+                        | mem::PAGE_EXECUTE_READWRITE
+                        | mem::PAGE_EXECUTE_WRITECOPY)
+                    != 0;
+                let temp = match (write, exec) {
+                    (true, true) => mem::PAGE_EXECUTE_READWRITE,
+                    (true, false) => mem::PAGE_READWRITE,
+                    (false, true) => mem::PAGE_EXECUTE_READ,
+                    (false, false) => mem::PAGE_READONLY,
+                };
+                let step_len = step_end - cur;
+                let mut old = 0u32;
+                if mem::VirtualProtect(cur as *const c_void, step_len, temp, &mut old) == 0 {
+                    return false;
+                }
+                self.saved.push((cur, step_len, old));
+            }
+            cur = step_end;
+        }
+        true
+    }
+}
+
+impl Drop for TempProtect {
+    fn drop(&mut self) {
+        for &(addr, len, old) in self.saved.iter().rev() {
+            let mut prev = 0u32;
+            unsafe {
+                mem::VirtualProtect(addr as *const c_void, len, old, &mut prev);
+            }
+        }
+    }
+}
+
 /// Copy `dst.len()` bytes starting at `offset` within `pages` (each a 64 KiB physical page
 /// number from `AllocateTitlePhysicalPages`). Returns `false` if `offset >= PHYS_PAGE_SIZE`,
 /// `pages` is too short, or any page is not a live allocation.
@@ -968,13 +1166,43 @@ pub unsafe fn read_physical_pages(pages: &[usize], offset: usize, dst: &mut [u8]
     if dst.is_empty() {
         return offset < PHYS_PAGE;
     }
-    let g = AWAY.lock().unwrap();
-    let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, dst.len()) else { return false };
-    let mut done = 0;
-    let mut page_off = offset;
-    for addr in addrs {
+    let Some(need) = (offset < PHYS_PAGE)
+        .then(|| offset.checked_add(dst.len()))
+        .flatten()
+        .map(|s| s.div_ceil(PHYS_PAGE))
+        .filter(|&n| pages.len() >= n)
+    else {
+        return false;
+    };
+    let (g, mut run) = (AWAY.lock().unwrap(), StateRun::default());
+    let mut srcs = Vec::with_capacity(need);
+    for &p in &pages[..need] {
+        let Some(home) = page_home(p) else { return false };
+        srcs.push(match g.as_ref().and_then(|a| a.page.get(&p).copied()) {
+            Some(at) => (!lazy::is_lazy(at)).then_some(at),
+            None => (!(lazy_home(home) && !committed_page_in(home, &mut run))).then_some(home),
+        });
+    }
+    let mut guard = TempProtect::default();
+    let (mut done, mut page_off) = (0, offset);
+    for &src in &srcs {
         let chunk = (PHYS_PAGE - page_off).min(dst.len() - done);
-        std::ptr::copy_nonoverlapping((addr + page_off) as *const u8, dst.as_mut_ptr().add(done), chunk);
+        if let Some(addr) = src {
+            if !guard.allow(addr + page_off, chunk, false) {
+                return false;
+            }
+        }
+        done += chunk;
+        page_off = 0;
+    }
+    let (mut done, mut page_off) = (0, offset);
+    for src in srcs {
+        let chunk = (PHYS_PAGE - page_off).min(dst.len() - done);
+        if let Some(addr) = src {
+            std::ptr::copy_nonoverlapping((addr + page_off) as *const u8, dst.as_mut_ptr().add(done), chunk);
+        } else {
+            dst[done..done + chunk].fill(0);
+        }
         done += chunk;
         page_off = 0;
     }
@@ -988,9 +1216,32 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
         return offset < PHYS_PAGE;
     }
     let g = AWAY.lock().unwrap();
+    let Some(need) = (offset < PHYS_PAGE)
+        .then(|| offset.checked_add(src.len()))
+        .flatten()
+        .map(|s| s.div_ceil(PHYS_PAGE))
+        .filter(|&n| pages.len() >= n)
+    else {
+        return false;
+    };
+    if pages[..need].iter().any(|&p| page_home(p).is_none()) {
+        return false;
+    }
     let Some(addrs) = resolve_physical_pages(g.as_ref(), pages, offset, src.len()) else { return false };
-    let mut done = 0;
-    let mut page_off = offset;
+    if addrs.iter().any(|&a| lazy::is_lazy(a) && !lazy::ensure(a, PHYS_PAGE)) {
+        return false;
+    }
+    let mut guard = TempProtect::default();
+    let (mut done, mut page_off) = (0, offset);
+    for &addr in &addrs {
+        let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
+        if !guard.allow(addr + page_off, chunk, true) {
+            return false;
+        }
+        done += chunk;
+        page_off = 0;
+    }
+    let (mut done, mut page_off) = (0, offset);
     for addr in addrs {
         let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
         std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (addr + page_off) as *mut u8, chunk);
@@ -1153,9 +1404,12 @@ unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usi
         away.gone.retain(|&h| Some(h) != own);
         let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
         if let Some(home) = home {
-            std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
-            #[cfg(test)]
-            tests::HOME_COPIES.with(|c| c.set(c.get() + 1));
+            let mut guard = TempProtect::default();
+            if guard.allow(at, PHYS_PAGE, false) && guard.allow(home, PHYS_PAGE, true) {
+                std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
+                #[cfg(test)]
+                tests::HOME_COPIES.with(|c| c.set(c.get() + 1));
+            }
         }
         // (an address among the homes the caller maps back is one of them: it stays)
         if !committed.contains(&at) {
@@ -1194,9 +1448,15 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     if !in_uma && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
         return Err(());
     }
+    {
+        let mut guard = TempProtect::default();
+        if !guard.allow(old, PHYS_PAGE, false) || !guard.allow(at, PHYS_PAGE, true) {
+            return Err(());
+        }
+        std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
+    }
     away.at.remove(&old);
     away.page.remove(&page);
-    std::ptr::copy_nonoverlapping(old as *const u8, at as *mut u8, PHYS_PAGE);
     if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
         crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
     }
@@ -1204,6 +1464,22 @@ unsafe fn move_away(away: &mut Away, old: usize, at: usize, page: usize, in_uma:
     away.at.insert(at, page);
     away.page.insert(page, at);
     Ok(true)
+}
+
+unsafe fn alloc_physical_home(u: &crate::gpu::uma::Uma, bytes: usize, n: usize) -> Option<usize> {
+    u.sparse_alloc(bytes, PHYS_PAGE)
+        .map(|(p, _)| p)
+        .or_else(|| (!u.has_sparse()).then(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).flatten())
+        .or_else(|| {
+            let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                crate::xlog_info!(
+                    "AllocateTitlePhysicalPages({n}): no room in unified memory – their home is plain memory"
+                );
+            });
+            (p != 0).then_some(p)
+        })
 }
 
 pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, num: *mut usize, arr: *mut usize) -> BOOL {
@@ -1223,12 +1499,7 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     // (a sparse or plain home is committed when it is used: `home_again`); without room in
     // unified memory plain memory (pages mapped into the title's own reservations never use
     // their home: a retail game's 6.1 GB of them did not fit next to its GPU heaps)
-    let block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).or_else(|| {
-        let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_info!("AllocateTitlePhysicalPages({n}): no room in unified memory – their home is plain memory"));
-        (p != 0).then_some(p)
-    });
+    let block = alloc_physical_home(u, bytes, n);
     let Some(block) = block else {
         crate::xlog_warn!("AllocateTitlePhysicalPages({n}): no room");
         fnd::SetLastError(fnd::ERROR_NOT_ENOUGH_MEMORY);
@@ -1253,6 +1524,7 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
         for i in 0..n {
             if let Some(at) = away.page.remove(&*arr.add(i)) {
                 away.at.remove(&at);
+                lazy::unmark(at);
                 note_mapping_at(at);
             }
         }
@@ -1281,19 +1553,19 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     1
 }
 
-pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, _p: u32, arr: *mut usize) -> *mut c_void {
+pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _t: u32, p: u32, arr: *mut usize) -> *mut c_void {
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let r = map_pages(away, va, n, arr);
+    let r = map_pages(away, va, n, sanitize_protect(p), arr);
     give_back_homes(away);
     r
 }
 
 /// `MapTitlePhysicalPages` with `AWAY` held; the homes it moves away are given back by the
 /// caller (`give_back_homes`).
-unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize) -> *mut c_void {
+unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, prot: u32, arr: *mut usize) -> *mut c_void {
     note_mapping_at(va as usize);
-    if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) {
+    if crate::gpu::uma::get().is_none() || n == 0 || (va.is_null() && arr.is_null()) || !is_valid_private_protect(prot) {
         fnd::SetLastError(fnd::ERROR_INVALID_PARAMETER);
         return std::ptr::null_mut();
     }
@@ -1348,6 +1620,9 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
             // both runs go – #556)
             match move_away(away, old, at, p, in_uma(at)) {
                 Ok(true) => {
+                    if !in_uma(at) && prot != mem::PAGE_READWRITE {
+                        mem::VirtualProtect(at as *const c_void, PHYS_PAGE, prot, &mut 0u32);
+                    }
                     (at_run, home_run) = Default::default();
                     continue;
                 }
@@ -1364,23 +1639,44 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         // a page never used (its home not committed) at the title's own reserved address space:
         // committed on first use (`lazy`) – GPU-owned targets placed there are never touched
         let plain = crate::gpu::uma::get().is_none_or(|u| !u.contains(at));
-        if fresh && plain && !committed_page_in(home, &mut home_run) {
-            lazy::mark(at);
+        let home_committed = committed_page_in(home, &mut home_run);
+        if fresh && plain && !home_committed && is_valid_lazy_protect(prot) {
+            lazy::mark_protect(at, prot);
             away.at.insert(at, p);
             away.page.insert(p, at);
             continue;
         }
-        if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
+        let commit_prot = if (home_committed || !fresh) && !prot_writable(prot) {
+            mem::PAGE_READWRITE
+        } else {
+            prot
+        };
+        if !in_uma(at) && mem::VirtualAlloc(at as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, commit_prot).is_null() {
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
             return std::ptr::null_mut();
         }
-        if committed_page(home) {
-            std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
+        if home_committed {
+            {
+                let mut guard = TempProtect::default();
+                if !guard.allow(home, PHYS_PAGE, false) || !guard.allow(at, PHYS_PAGE, true) {
+                    fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+                    return std::ptr::null_mut();
+                }
+                std::ptr::copy_nonoverlapping(home as *const u8, at as *mut u8, PHYS_PAGE);
+            }
             if move_home_away(away, home) {
                 (at_run, home_run) = Default::default();
             }
         } else if !fresh {
+            let mut guard = TempProtect::default();
+            if !guard.allow(at, PHYS_PAGE, true) {
+                fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+                return std::ptr::null_mut();
+            }
             std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE); // a page never used: zeros
+        }
+        if !in_uma(at) && commit_prot != prot {
+            mem::VirtualProtect(at as *const c_void, PHYS_PAGE, prot, &mut 0u32);
         }
         if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
             crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
@@ -1415,7 +1711,7 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     }
     let mut g = AWAY.lock().unwrap();
     let away = g.get_or_insert_with(Away::default);
-    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, pages.add(i) as *mut usize).is_null());
+    let ok = (0..n).all(|i| !map_pages(away, *addresses.add(i), 1, mem::PAGE_READWRITE, pages.add(i) as *mut usize).is_null());
     give_back_homes(away);
     ok as BOOL
 }
@@ -3078,6 +3374,328 @@ mod tests {
             assert_eq!(VirtualFree(gpu, 0, mem::MEM_RELEASE), 1);
             assert_eq!(mirrors::source(gpu as usize + 0x2_0000), None);
             assert_eq!(VirtualFree(cpu, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn free_and_virtual_free_unmark_lazy_pages() {
+        unsafe {
+            let Some(mut pages) = sparse_pages(3) else { return };
+            let r = mem::VirtualAlloc(std::ptr::null(), 3 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 3, 0, mem::PAGE_READWRITE, pages.as_mut_ptr()) as usize, r);
+            assert!((0..3).all(|i| lazy::is_lazy(r + i * PHYS_PAGE) && physical_page_at(r + i * PHYS_PAGE)));
+            assert!(
+                FreeTitlePhysicalPages(std::ptr::null_mut(), 1, &mut pages[0]) == 1
+                    && !lazy::is_lazy(r)
+                    && !physical_page_at(r)
+                    && lazy::is_lazy(r + PHYS_PAGE)
+            );
+            assert!(
+                VirtualFree((r + PHYS_PAGE) as *mut c_void, PHYS_PAGE, mem::MEM_DECOMMIT) == 1
+                    && !lazy::is_lazy(r + PHYS_PAGE)
+                    && !physical_page_at(r + PHYS_PAGE)
+            );
+            assert!(
+                !mem::VirtualAlloc(r as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null()
+                    && VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE) == 1
+            );
+            assert!(
+                !lazy::is_lazy(r + 2 * PHYS_PAGE)
+                    && !physical_page_at(r + 2 * PHYS_PAGE)
+                    && FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages[1..].as_mut_ptr()) == 1
+            );
+        }
+    }
+
+    #[test]
+    fn read_physical_pages_reads_zeros_without_committing() {
+        unsafe {
+            let Some(mut pages) = sparse_pages(2) else { return };
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, mem::PAGE_READWRITE, &mut pages[0]) as usize, r);
+            let (h1, mut buf, mut out) = (page_home(pages[1]).unwrap(), vec![0xAAu8; 2 * PHYS_PAGE], [0u8; 4]);
+            assert!(
+                read_physical_pages(&pages, 0, &mut buf)
+                    && buf.iter().all(|&b| b == 0)
+                    && lazy::is_lazy(r)
+                    && !committed_page(r)
+                    && !committed_page(h1)
+            );
+            assert!(
+                write_physical_pages(&pages, 16, &[1, 2, 3, 4])
+                    && !lazy::is_lazy(r)
+                    && committed_page(r)
+                    && !committed_page(h1)
+                    && read_physical_pages(&pages, 16, &mut out)
+                    && out == [1, 2, 3, 4]
+            );
+            assert_eq!(
+                (FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE)),
+                (1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_query_and_xmem_virtual_query_see_lazy_pages_as_committed() {
+        unsafe {
+            let Some(mut pages) = sparse_pages(2) else { return };
+            let r = mem::VirtualAlloc(std::ptr::null(), 3 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, mem::PAGE_READWRITE, &mut pages[0]) as usize, r);
+            assert_eq!(
+                MapTitlePhysicalPages((r + PHYS_PAGE) as *mut c_void, 1, 0, mem::PAGE_READONLY, &mut pages[1]) as usize,
+                r + PHYS_PAGE
+            );
+            let cur = thr::GetCurrentProcess();
+            let (mut m, mut xinfo, mut old) = (std::mem::zeroed::<mem::MEMORY_BASIC_INFORMATION>(), [0u64; 8], 0u32);
+            let sz = std::mem::size_of_val(&m);
+            assert_eq!(VirtualQuery((r + 0x1234) as *const c_void, &mut m, sz), sz);
+            assert_eq!(
+                (m.State, m.Protect, m.BaseAddress as usize, m.RegionSize),
+                (mem::MEM_COMMIT, mem::PAGE_READWRITE, r + 0x1000, PHYS_PAGE - 0x1000)
+            );
+            assert_eq!(VirtualQueryEx(cur, (r + PHYS_PAGE) as *const c_void, &mut m, sz), sz);
+            assert_eq!(
+                (m.State, m.Protect, m.RegionSize),
+                (mem::MEM_COMMIT, mem::PAGE_READONLY, PHYS_PAGE)
+            );
+            assert_eq!(XMemVirtualQuery(cur, (r + PHYS_PAGE) as *const c_void, xinfo.as_mut_ptr() as *mut c_void), 1);
+            let xm = &*(xinfo.as_ptr() as *const mem::MEMORY_BASIC_INFORMATION);
+            assert_eq!((xm.State, xm.Protect, (xinfo[6] as u32) & 3), (mem::MEM_COMMIT, mem::PAGE_READONLY, 1));
+            assert_eq!((VirtualProtect(r as *const c_void, PHYS_PAGE, mem::PAGE_READONLY, &mut old), old), (1, mem::PAGE_READWRITE));
+            assert_eq!(VirtualQuery(r as *const c_void, &mut m, sz), sz);
+            assert_eq!(
+                (m.State, m.Protect, m.RegionSize, committed_page(r), committed_page(r + PHYS_PAGE)),
+                (mem::MEM_COMMIT, mem::PAGE_READONLY, 2 * PHYS_PAGE, false, false)
+            );
+            assert_eq!(
+                (FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE)),
+                (1, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn allocate_physical_pages_skips_coherent_uma_when_sparse_is_present() {
+        unsafe {
+            if let Some(u) = crate::gpu::uma::Uma::new(8 << 20).filter(|u| u.has_sparse()) {
+                while u.sparse_reserve(crate::gpu::uma::WINDOW).is_some() {}
+                let (used, home) = (u.used(), alloc_physical_home(&u, PHYS_PAGE, 1).expect("plain MEM_RESERVE"));
+                assert!(
+                    u.sparse_alloc(PHYS_PAGE, PHYS_PAGE).is_none()
+                        && !u.contains(home)
+                        && u.used() == used
+                        && !committed_page(home)
+                );
+                mem::VirtualFree(home as *mut c_void, 0, mem::MEM_RELEASE);
+            }
+            if let Some(u) = crate::gpu::uma::Uma::with_windows(1, 8 << 20) {
+                let home = alloc_physical_home(&u, PHYS_PAGE, 1).expect("coherent UMA");
+                assert!(!u.has_sparse() && u.is_committed(home) && u.free(home));
+            }
+        }
+    }
+
+    #[test]
+    fn physical_page_rw_and_remap_handle_non_rw_protections() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 3usize;
+            let mut pages = [0usize; 3];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let r1 = mem::VirtualAlloc(std::ptr::null(), 3 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let r2 = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert!(r1 != 0 && r2 != 0);
+
+            // Reject invalid MEM_PRIVATE protections up front.
+            for bad in [
+                mem::PAGE_WRITECOPY,
+                mem::PAGE_EXECUTE_WRITECOPY,
+                mem::PAGE_READWRITE | mem::PAGE_NOCACHE | mem::PAGE_WRITECOMBINE,
+            ] {
+                fnd::SetLastError(0);
+                assert!(MapTitlePhysicalPages(r1 as *mut c_void, 1, 0, bad, &mut pages[0]).is_null());
+                assert_eq!(fnd::GetLastError(), fnd::ERROR_INVALID_PARAMETER);
+            }
+
+            let vq_prot = |a: usize| {
+                let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                assert_ne!(mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)), 0);
+                (m.State, m.Protect)
+            };
+
+            // Page 0: PAGE_READONLY; Page 1: PAGE_NOACCESS; Page 2: mixed sub-page protections.
+            assert_eq!(MapTitlePhysicalPages(r1 as *mut c_void, 1, 0, mem::PAGE_READONLY, &mut pages[0]) as usize, r1);
+            assert_eq!(
+                MapTitlePhysicalPages((r1 + PHYS_PAGE) as *mut c_void, 1, 0, mem::PAGE_NOACCESS, &mut pages[1]) as usize,
+                r1 + PHYS_PAGE
+            );
+            assert_eq!(
+                MapTitlePhysicalPages((r1 + 2 * PHYS_PAGE) as *mut c_void, 1, 0, mem::PAGE_READWRITE, &mut pages[2]) as usize,
+                r1 + 2 * PHYS_PAGE
+            );
+            assert!(lazy::ensure(r1 + 2 * PHYS_PAGE, PHYS_PAGE));
+            let mut old = 0u32;
+            let p2 = r1 + 2 * PHYS_PAGE;
+            assert_ne!(mem::VirtualProtect(p2 as *const c_void, 0x1000, mem::PAGE_NOACCESS, &mut old), 0);
+            assert_ne!(mem::VirtualProtect((p2 + 0x1000) as *const c_void, 0x1000, mem::PAGE_READONLY, &mut old), 0);
+            assert_ne!(
+                mem::VirtualProtect((p2 + 0x2000) as *const c_void, 0x1000, mem::PAGE_READWRITE | mem::PAGE_GUARD, &mut old),
+                0
+            );
+
+            // Write & read across PAGE_READONLY, PAGE_NOACCESS, and mixed sub-pages; exact protections must restore.
+            if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(page_home(pages[0]).unwrap())) {
+                assert!(lazy::is_lazy(r1), "fresh PAGE_READONLY page starts lazy");
+                let mut z = [0xEEu8; 4];
+                assert!(read_physical_pages(&pages[0..1], 32, &mut z) && z == [0; 4] && lazy::is_lazy(r1));
+                let mut old_vp = 0u32;
+                assert_eq!(VirtualProtect(r1 as *const c_void, PHYS_PAGE, mem::PAGE_WRITECOPY, &mut old_vp), 0);
+                assert_eq!(
+                    VirtualProtect(
+                        r1 as *const c_void,
+                        PHYS_PAGE,
+                        mem::PAGE_READWRITE | mem::PAGE_NOCACHE | mem::PAGE_WRITECOMBINE,
+                        &mut old_vp
+                    ),
+                    0
+                );
+                assert!(lazy::is_lazy(r1), "invalid VirtualProtect leaves page lazy");
+            }
+            let payload_ro = [0x11u8, 0x22, 0x33, 0x44];
+            assert!(write_physical_pages(&pages[0..1], 32, &payload_ro));
+            assert!(!lazy::is_lazy(r1));
+            assert_eq!(vq_prot(r1), (mem::MEM_COMMIT, mem::PAGE_READONLY));
+            let mut got = [0u8; 4];
+            assert!(read_physical_pages(&pages[0..1], 32, &mut got) && got == payload_ro);
+            assert_eq!(vq_prot(r1), (mem::MEM_COMMIT, mem::PAGE_READONLY));
+
+            let payload_na = [0xAAu8, 0xBB, 0xCC, 0xDD];
+            assert!(write_physical_pages(&pages[1..2], 64, &payload_na));
+            assert_eq!(vq_prot(r1 + PHYS_PAGE), (mem::MEM_COMMIT, mem::PAGE_NOACCESS));
+            got = [0; 4];
+            assert!(read_physical_pages(&pages[1..2], 64, &mut got) && got == payload_na);
+            assert_eq!(vq_prot(r1 + PHYS_PAGE), (mem::MEM_COMMIT, mem::PAGE_NOACCESS));
+
+            let mixed_in = vec![0x5Au8; 0x3800];
+            assert!(write_physical_pages(&pages[2..3], 0x400, &mixed_in));
+            assert_eq!(vq_prot(p2), (mem::MEM_COMMIT, mem::PAGE_NOACCESS));
+            assert_eq!(vq_prot(p2 + 0x1000), (mem::MEM_COMMIT, mem::PAGE_READONLY));
+            assert_eq!(vq_prot(p2 + 0x2000), (mem::MEM_COMMIT, mem::PAGE_READWRITE | mem::PAGE_GUARD));
+            assert_eq!(vq_prot(p2 + 0x3000), (mem::MEM_COMMIT, mem::PAGE_READWRITE));
+            let mut mixed_out = vec![0u8; 0x3800];
+            assert!(read_physical_pages(&pages[2..3], 0x400, &mut mixed_out) && mixed_out == mixed_in);
+            assert_eq!(vq_prot(p2), (mem::MEM_COMMIT, mem::PAGE_NOACCESS));
+            assert_eq!(vq_prot(p2 + 0x1000), (mem::MEM_COMMIT, mem::PAGE_READONLY));
+            assert_eq!(vq_prot(p2 + 0x2000), (mem::MEM_COMMIT, mem::PAGE_READWRITE | mem::PAGE_GUARD));
+            assert_eq!(vq_prot(p2 + 0x3000), (mem::MEM_COMMIT, mem::PAGE_READWRITE));
+
+            // move_away and unmap_away on a PAGE_NOACCESS source must copy without AV.
+            assert_eq!(MapTitlePhysicalPages(r2 as *mut c_void, 1, 0, mem::PAGE_NOACCESS, &mut pages[1]) as usize, r2);
+            assert_eq!(vq_prot(r2), (mem::MEM_COMMIT, mem::PAGE_NOACCESS));
+            got = [0; 4];
+            assert!(read_physical_pages(&pages[1..2], 64, &mut got) && got == payload_na);
+            let home_all = MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, mem::PAGE_READWRITE, pages.as_mut_ptr()) as usize;
+            assert_ne!(home_all, 0);
+            assert_eq!(std::slice::from_raw_parts((home_all + 32) as *const u8, 4), &payload_ro);
+            assert_eq!(std::slice::from_raw_parts((home_all + PHYS_PAGE + 64) as *const u8, 4), &payload_na);
+            assert_eq!(std::slice::from_raw_parts((home_all + 2 * PHYS_PAGE + 0x400) as *const u8, 0x3800), &mixed_in[..]);
+
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
+            assert_eq!(VirtualFree(r1 as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(VirtualFree(r2 as *mut c_void, 0, mem::MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn patch_lazy_mbi_clamps_reserved_hole_before_lazy_page() {
+        unsafe {
+            let r = mem::VirtualAlloc(std::ptr::null(), 4 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            // Leave page 0 and page 3 unmapped (MEM_RESERVE); mark page 1 RO and page 2 RW lazy.
+            lazy::mark_protect(r + PHYS_PAGE, mem::PAGE_READONLY);
+            lazy::mark_protect(r + 2 * PHYS_PAGE, mem::PAGE_READWRITE);
+
+            let mut m: mem::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            let sz = std::mem::size_of_val(&m);
+
+            // Querying at base of reserved hole must stop at page 1, not span across lazy pages.
+            assert_eq!(VirtualQuery(r as *const c_void, &mut m, sz), sz);
+            assert_eq!((m.BaseAddress as usize, m.State, m.RegionSize), (r, mem::MEM_RESERVE, PHYS_PAGE));
+
+            // Querying mid-hole must clamp to the remaining bytes before page 1.
+            assert_eq!(VirtualQuery((r + 0x2345) as *const c_void, &mut m, sz), sz);
+            assert_eq!(
+                (m.BaseAddress as usize, m.State, m.RegionSize),
+                (r + 0x2000, mem::MEM_RESERVE, PHYS_PAGE - 0x2000)
+            );
+
+            // XMemVirtualQuery on the reserved hole reports MEM_RESERVE, clamped size, non-CPU-readable.
+            let mut xinfo = [0u64; 8];
+            assert_eq!(XMemVirtualQuery(thr::GetCurrentProcess(), r as *const c_void, xinfo.as_mut_ptr() as *mut c_void), 1);
+            let xm = &*(xinfo.as_ptr() as *const mem::MEMORY_BASIC_INFORMATION);
+            assert_eq!((xm.State, xm.RegionSize, (xinfo[6] as u32) & 3), (mem::MEM_RESERVE, PHYS_PAGE, 0));
+
+            // Full VirtualQuery walk across the reservation discovers all 4 regions cleanly.
+            let mut walked = Vec::new();
+            let mut cur = r;
+            while cur < r + 4 * PHYS_PAGE {
+                assert_eq!(VirtualQuery(cur as *const c_void, &mut m, sz), sz);
+                assert!(m.RegionSize > 0);
+                walked.push((m.BaseAddress as usize, m.RegionSize, m.State, m.Protect));
+                cur = (m.BaseAddress as usize) + m.RegionSize;
+            }
+            assert_eq!(
+                walked,
+                vec![
+                    (r, PHYS_PAGE, mem::MEM_RESERVE, 0),
+                    (r + PHYS_PAGE, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READONLY),
+                    (r + 2 * PHYS_PAGE, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE),
+                    (r + 3 * PHYS_PAGE, PHYS_PAGE, mem::MEM_RESERVE, 0),
+                ]
+            );
+
+            assert_eq!(VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!(!lazy::is_lazy(r + PHYS_PAGE) && !lazy::is_lazy(r + 2 * PHYS_PAGE));
+        }
+    }
+
+    #[test]
+    fn allocation_span_handles_interior_address_in_multi_region_reservation() {
+        unsafe {
+            let r = mem::VirtualAlloc(std::ptr::null(), 4 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert_ne!(r, 0);
+            // Split into 4 distinct regions: commit RW, reserve, commit RO, reserve.
+            assert!(!mem::VirtualAlloc(r as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null());
+            assert!(
+                !mem::VirtualAlloc((r + 2 * PHYS_PAGE) as *const c_void, PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READONLY)
+                    .is_null()
+            );
+
+            for probe in [
+                r,
+                r + 0x123,
+                r + PHYS_PAGE + 0x2000,
+                r + 2 * PHYS_PAGE + 0x3456,
+                r + 3 * PHYS_PAGE + 0xF000,
+            ] {
+                assert_eq!(allocation_span(probe), Some((r, 4 * PHYS_PAGE)), "probe {probe:#x}");
+            }
+
+            // Interior MEM_DECOMMIT with size == 0 clears lazy pages from addr to end, keeping earlier ones.
+            lazy::mark_protect(r + PHYS_PAGE, mem::PAGE_READWRITE);
+            lazy::mark_protect(r + 3 * PHYS_PAGE, mem::PAGE_READWRITE);
+            if VirtualFree((r + 2 * PHYS_PAGE) as *mut c_void, 0, mem::MEM_DECOMMIT) != 0 {
+                assert!(lazy::is_lazy(r + PHYS_PAGE), "earlier page before interior decommit stays lazy");
+                assert!(!lazy::is_lazy(r + 3 * PHYS_PAGE), "trailing page after interior decommit is cleared");
+            }
+
+            // Unaligned base on MEM_RELEASE (or base fallback) releases the entire allocation and clears lazy entries.
+            if VirtualFree((r + 0x100) as *mut c_void, 0, mem::MEM_RELEASE) == 0 {
+                assert_eq!(VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            }
+            assert!(!lazy::is_lazy(r + PHYS_PAGE) && !lazy::is_lazy(r + 3 * PHYS_PAGE));
+            assert_eq!(allocation_span(r), None);
         }
     }
 }

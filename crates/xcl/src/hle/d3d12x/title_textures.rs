@@ -20,7 +20,7 @@
 //! (`note_transitions`) and applied, in submission order, when the list is submitted
 //! (`submitted`) – per subresource once a transition names one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -315,7 +315,34 @@ static TEXTURES_LEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 static WATCH_CACHE: Mutex<Option<((u64, u64, u64), Arc<Vec<(usize, usize)>>)>> = Mutex::new(None);
 /// the queue uploads go to, per device
 static QUEUES: Mutex<BTreeMap<usize, ID3D12CommandQueue>> = Mutex::new(BTreeMap::new());
+struct PendingUploadFence { fence: ID3D12Fence, value: u64, upload_queue: usize, waited: BTreeSet<usize> }
+/// latest signalled texture-upload fence per device so title queues wait before consuming textures
+static PENDING_UPLOAD_FENCE: Mutex<BTreeMap<usize, PendingUploadFence>> = Mutex::new(BTreeMap::new());
 static UPLOADS: AtomicU64 = AtomicU64::new(0);
+
+fn record_upload_fence(device: usize, upload_queue: usize, fence: ID3D12Fence, value: u64) {
+    PENDING_UPLOAD_FENCE.lock().unwrap().insert(device, PendingUploadFence { fence, value, upload_queue, waited: BTreeSet::new() });
+}
+
+unsafe fn wait_pending_uploads(queue: *mut c_void) {
+    if PENDING_UPLOAD_FENCE.lock().unwrap().is_empty() { return; }
+    let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let mut dev: Option<ID3D12Device> = None;
+    if q.GetDevice(&mut dev).is_err() { return; }
+    let Some(dev) = dev else { return };
+    let (dev_key, q_key) = (dev.as_raw() as usize, q.as_raw() as usize);
+    let mut g = PENDING_UPLOAD_FENCE.lock().unwrap();
+    let Some(p) = g.get_mut(&dev_key) else { return };
+    let done = p.fence.GetCompletedValue();
+    if done != u64::MAX && done >= p.value {
+        g.remove(&dev_key);
+        return;
+    }
+    if q_key != p.upload_queue && !p.waited.contains(&q_key) && q.Wait(&p.fence, p.value).is_ok() {
+        super::list_x::note_internal_wait(q_key, "title texture uploads", &p.fence, p.value);
+        p.waited.insert(q_key);
+    }
+}
 
 /// Number of textures kept in title memory and uploads done so far.
 pub fn counts() -> (usize, u64) {
@@ -641,10 +668,10 @@ fn cached_watch_ranges(u: &crate::gpu::uma::Uma) -> Arc<Vec<(usize, usize)>> {
 
 /// Run `f` as XCL's own GPU work: ExecuteCommandLists inside it does not refresh.
 pub(super) fn own_work<R>(f: impl FnOnce() -> R) -> R {
-    let was = BUSY.with(|b| b.replace(true));
-    let r = f();
-    BUSY.with(|b| b.set(was));
-    r
+    struct Guard(bool);
+    impl Drop for Guard { fn drop(&mut self) { BUSY.with(|b| b.set(self.0)); } }
+    let _guard = Guard(BUSY.with(|b| b.replace(true)));
+    f()
 }
 
 /// Whether the current thread is inside XCL's own internal GPU setup/upload/readback work.
@@ -660,7 +687,10 @@ pub(super) unsafe fn refresh(queue: *mut c_void) {
         return;
     }
     let _refresh = REFRESH.lock().unwrap();
-    own_work(|| refresh_once(queue));
+    own_work(|| {
+        refresh_once(queue);
+        wait_pending_uploads(queue);
+    });
 }
 
 /// The pages of `[base, base + size)` written since the last look, added to `dirty` and reset
@@ -789,10 +819,27 @@ fn unchanged_skip() -> bool {
     *ON.get_or_init(|| std::env::var("XCL_TEXTURE_SKIP_UNCHANGED").map_or(true, |v| v.trim() != "0"))
 }
 
-/// Whether texture `res` was last uploaded from memory with hash `h`; `h` is remembered as its
-/// content from here on (the caller uploads it when this is false).
-fn same_as_last_upload(res: usize, h: u64) -> bool {
-    LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+/// Whether texture `res` was last successfully uploaded from memory with hash `h` (read-only).
+fn matches_last_upload(res: usize, h: u64) -> bool {
+    LAST_CONTENT.lock().unwrap().get(&res).copied() == Some(h)
+}
+
+/// Record content hashes for textures whose upload succeeded.
+fn record_last_uploads(hashes: impl IntoIterator<Item = (usize, u64)>) {
+    LAST_CONTENT.lock().unwrap().extend(hashes);
+}
+
+/// Mark active textures in `resources` pending again after a failed batch so the next submit retries them.
+fn restore_pending(resources: impl IntoIterator<Item = usize>) {
+    let mut restored = 0usize;
+    let mut t = TEXTURES.lock().unwrap();
+    for res in resources {
+        if let Some(e) = t.by_res.get_mut(&res) {
+            if !e.pending { e.pending = true; restored += 1; }
+        }
+    }
+    drop(t);
+    if restored > 0 { PENDING.fetch_add(restored, Ordering::Relaxed); }
 }
 
 /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
@@ -831,6 +878,22 @@ fn batch_fits(picked_count: usize, picked_bytes: usize, batch_dev: usize, next_d
             && picked_bytes.saturating_add(next_bytes) <= BATCH_BYTES)
 }
 
+fn finish_upload_batch(batch_res: &[usize], hashes: &[(usize, u64)], remaining: impl IntoIterator<Item = usize>, result: Result<(Vec<usize>, Vec<(usize, String)>), String>, warn: &impl Fn(&str)) -> bool {
+    match result {
+        Ok((succeeded, failed)) => {
+            for (_, e) in failed { warn(&e); }
+            record_last_uploads(succeeded.iter().filter_map(|&k| hashes.get(k).copied()));
+            UPLOADS.fetch_add(succeeded.len() as u64, Ordering::Relaxed);
+            true
+        }
+        Err(e) => {
+            warn(&e);
+            restore_pending(batch_res.iter().copied().chain(remaining));
+            false
+        }
+    }
+}
+
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` and `BATCH_ITEMS` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -842,6 +905,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
     let mut todo = todo.into_iter().peekable();
     while todo.peek().is_some() {
         let mut picked = Vec::new();
+        let mut hashes = Vec::new();
         let mut bytes = 0usize;
         let mut device = 0usize;
         while let Some((_, (dev, _, tex, _))) = todo.peek() {
@@ -855,13 +919,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
                 let h = content_hash(&title_bytes(va, tex.size() as usize));
-                if same_as_last_upload(r.as_raw() as usize, h) {
+                if matches_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
                         crate::xlog_info!("title textures: {n} uploads left out so far – the texture's memory held what it held at its last upload");
                     }
                     continue;
                 }
+                hashes.push((r.as_raw() as usize, h));
             }
             device = dev;
             bytes += tex.size() as usize;
@@ -878,26 +943,33 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             }
             batch.push((r, subs, states));
         }
+        let batch_res: Vec<usize> = batch.iter().map(|(r, ..)| r.as_raw() as usize).collect();
         let d = device as *mut c_void;
         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
         let queue = match upload_queue(dev, device) {
             Ok(q) => q,
             Err(e) => {
-                warn(&e);
-                continue;
+                finish_upload_batch(&batch_res, &hashes, todo.map(|(r, _)| r.as_raw() as usize), Err(e), &warn);
+                break;
             }
         };
-        match own_work(|| {
+        let q_raw = queue.as_raw() as usize;
+        let outcome = match own_work(|| {
             super::vram::before_execute(&queue);
-            texture::upload_batch(dev, &queue, &batch)
+            texture::upload_batch_checked(dev, &queue, &batch)
         }) {
-            Ok(failed) => {
-                for (_, e) in failed {
-                    warn(&e);
-                }
-                UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            Ok(r) => {
+                if let Some((f, v)) = r.fence { record_upload_fence(device, q_raw, f, v); }
+                Ok((r.succeeded, r.failed))
             }
-            Err(e) => warn(&e),
+            Err(e) => {
+                for (_, ie) in e.failed { warn(&ie); }
+                if let Some((f, v)) = e.pending_fence { record_upload_fence(device, q_raw, f, v); }
+                Err(e.message)
+            }
+        };
+        if !finish_upload_batch(&batch_res, &hashes, todo.by_ref().map(|(r, _)| r.as_raw() as usize), outcome, &warn) {
+            break;
         }
     }
 }
@@ -1023,6 +1095,7 @@ unsafe fn upload_queue(dev: &ID3D12Device, device: usize) -> Result<ID3D12Comman
         return Ok(q.clone());
     }
     let made: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(|e| e.to_string())?;
+    let _ = made.SetName(windows::core::w!("xcl title texture upload queue"));
     q.insert(device, made.clone());
     Ok(made)
 }
@@ -1215,9 +1288,10 @@ mod tests {
         let mut mem = vec![0u8; 3 << 20];
         mem[5] = 1;
         let h = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h), "the first upload is not left out");
-        assert!(same_as_last_upload(a, h), "the same bytes again: left out");
-        assert!(!same_as_last_upload(b, h), "another texture over the same bytes has its own first upload");
+        assert!(!matches_last_upload(a, h), "the first upload is not left out");
+        record_last_uploads([(a, h)]);
+        assert!(matches_last_upload(a, h), "the same bytes again: left out");
+        assert!(!matches_last_upload(b, h), "another texture over the same bytes has its own first upload");
         // one byte anywhere, also in the tail that is not a whole 32-byte step
         for at in [0usize, 31, 32, (3 << 20) - 1] {
             let mut m = mem.clone();
@@ -1226,12 +1300,13 @@ mod tests {
         }
         mem[(3 << 20) - 1] = 9;
         let h2 = content_hash(&mem);
-        assert!(!same_as_last_upload(a, h2), "changed memory is uploaded");
-        assert!(same_as_last_upload(a, h2));
+        assert!(!matches_last_upload(a, h2), "changed memory is uploaded");
+        record_last_uploads([(a, h2)]);
+        assert!(matches_last_upload(a, h2));
         // the length is part of the content: a prefix of zeros is not the whole
         assert_ne!(content_hash(&[0u8; 64]), content_hash(&[0u8; 96]));
         forget(a);
-        assert!(!same_as_last_upload(a, h2), "forgotten: its next upload is a first one");
+        assert!(!matches_last_upload(a, h2), "forgotten: its next upload is a first one");
         forget(a);
         forget(b);
     }
@@ -2047,5 +2122,41 @@ mod tests {
 
         // Different device always starts a new batch.
         assert!(!batch_fits(1, 4096, 1, 2, 4096));
+    }
+
+    #[test]
+    fn upload_failure_preserves_pending_and_does_not_poison_last_content() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tex = Arc::new(xg::Texture::new(&console_desc(3, 64, 64, 1, 1, 28, 0x105)).unwrap());
+        let (r1, r2, r3) = (0x7E57_2109_1000usize, 0x7E57_2109_2000usize, 0x7E57_2109_3000usize);
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            for (r, device, va) in [(r1, 1, 0x7E57_2109_0000), (r2, 1, 0x7E57_210A_0000), (r3, 2, 0x7E57_210B_0000)] {
+                t.insert(r, Entry { device, va, src: va, in_gpu_view: false, tex: Arc::clone(&tex), states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: false, placed: false, unmapped: false, seq: 0 });
+            }
+            TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        }
+        let (pending0, batch_res, hashes) = (PENDING.load(Ordering::Relaxed), [r1, r2], [(r1, 11u64), (r2, 22u64)]);
+        assert!(!matches_last_upload(r1, 11) && !matches_last_upload(r1, 11));
+        assert!(!finish_upload_batch(&batch_res, &hashes, [r3], Err("simulated timeout".into()), &|_| {}));
+        assert_eq!(PENDING.load(Ordering::Relaxed), pending0 + 3);
+        assert!({ let t = TEXTURES.lock().unwrap(); t.by_res[&r1].pending && t.by_res[&r2].pending && t.by_res[&r3].pending });
+        assert!(!matches_last_upload(r1, 11) && !matches_last_upload(r2, 22) && !matches_last_upload(r3, 33));
+        assert!(finish_upload_batch(&batch_res, &hashes, [], Ok((vec![0], vec![(1, "bad layout".into())])), &|_| {}));
+        assert!(matches_last_upload(r1, 11) && !matches_last_upload(r2, 22));
+        for r in [r1, r2, r3] { forget(r); }
+    }
+
+    #[test]
+    fn own_work_restores_busy_flag_on_panic() {
+        assert!(!is_own_work());
+        assert!(std::panic::catch_unwind(|| own_work(|| { assert!(is_own_work()); panic!("boom"); })).is_err());
+        assert!(!is_own_work());
+        own_work(|| {
+            assert!(is_own_work());
+            assert!(std::panic::catch_unwind(|| own_work(|| { assert!(is_own_work()); panic!("nested"); })).is_err());
+            assert!(is_own_work());
+        });
+        assert!(!is_own_work());
     }
 }

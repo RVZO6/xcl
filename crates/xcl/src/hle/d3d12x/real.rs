@@ -465,6 +465,8 @@ fn graphics_wave32(device: *mut c_void) -> bool {
     }
 }
 
+static DEBUG_LAYER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 /// Create the process-wide D3D12 device (the adapter `d3d12_adapter` / `XCL_ADAPTER` chooses,
 /// by default the high-performance GPU → WARP); once – later calls
 /// return the existing device's adapter.
@@ -488,6 +490,7 @@ pub fn init() -> Result<String, String> {
             match crate::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
                 Ok(d) => {
                     d.EnableDebugLayer();
+                    DEBUG_LAYER_ACTIVE.store(true, Ordering::Release);
                     crate::xlog_info!("D3D12: debug layer enabled");
                 }
                 Err(e) => {
@@ -3611,9 +3614,13 @@ fn pso_trace() -> bool {
 /// `[SHADER]` lines and `xcl shaders --measure-pso`) and whether a driver blob was supplied.
 /// Also returns the time spent in the driver alone (not waiting for a slot).
 fn driver_compile_identified<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
+    driver_compile_with_wanted(kind, bytes, gate, record, super::pso_async::build_is_wanted, build)
+}
+
+fn driver_compile_with_wanted<R>(kind: &str, bytes: usize, gate: bool, record: Option<(u64, bool)>, wanted: impl Fn() -> bool, build: impl FnOnce() -> R) -> (R, std::time::Duration) {
     let huge = gate && bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
-    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
+    let slot = huge.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), wanted)).flatten();
     let waited = waited.elapsed();
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -3833,6 +3840,64 @@ mod big_compile_tests {
     }
 }
 
+enum FlightState { InFlight, Done(Option<std::sync::Arc<Vec<u8>>>) }
+struct FlightEntry { state: Mutex<FlightState>, cv: std::sync::Condvar, follower_wanted: AtomicBool, followers: AtomicUsize }
+enum FlightRole<'a, K: Eq + std::hash::Hash + Copy> { Leader(FlightGuard<'a, K>), Follower(Option<std::sync::Arc<Vec<u8>>>) }
+/// Coalesces concurrent cold driver PSO compiles by key; `FlightGuard::Drop` wakes followers on error/panic.
+struct PsoFlight<K: Eq + std::hash::Hash + Copy> { inflight: Mutex<Option<HashMap<K, std::sync::Arc<FlightEntry>>>> }
+struct FlightGuard<'a, K: Eq + std::hash::Hash + Copy> { flight: &'a PsoFlight<K>, key: K, entry: std::sync::Arc<FlightEntry>, done: bool }
+impl<K: Eq + std::hash::Hash + Copy> PsoFlight<K> {
+    const fn new() -> Self { Self { inflight: Mutex::new(None) } }
+    fn enter(&self, key: K, is_wanted: bool) -> FlightRole<'_, K> {
+        let entry = {
+            let mut g = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
+            let map = g.get_or_insert_with(HashMap::new);
+            if let Some(existing) = map.get(&key) {
+                existing.followers.fetch_add(1, Ordering::Release);
+                if is_wanted { existing.follower_wanted.store(true, Ordering::Release); }
+                existing.clone()
+            } else {
+                let entry = std::sync::Arc::new(FlightEntry { state: Mutex::new(FlightState::InFlight), cv: std::sync::Condvar::new(), follower_wanted: AtomicBool::new(is_wanted), followers: AtomicUsize::new(0) });
+                map.insert(key, entry.clone());
+                return FlightRole::Leader(FlightGuard { flight: self, key, entry, done: false });
+            }
+        };
+        let mut st = entry.state.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let FlightState::Done(ref blob) = *st { return FlightRole::Follower(blob.clone()); }
+            if !entry.follower_wanted.load(Ordering::Relaxed) && super::pso_async::build_is_wanted() { entry.follower_wanted.store(true, Ordering::Release); }
+            st = if entry.follower_wanted.load(Ordering::Relaxed) { entry.cv.wait(st).unwrap_or_else(|e| e.into_inner()) } else { entry.cv.wait_timeout(st, std::time::Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0 };
+        }
+    }
+}
+impl<K: Eq + std::hash::Hash + Copy> FlightGuard<'_, K> {
+    fn is_wanted(&self) -> bool { self.entry.follower_wanted.load(Ordering::Acquire) }
+    fn has_followers(&self) -> bool { self.entry.followers.load(Ordering::Acquire) > 0 }
+    #[cfg(test)] fn follower_count(&self) -> usize { self.entry.followers.load(Ordering::Acquire) }
+    fn complete(&mut self, blob: Option<std::sync::Arc<Vec<u8>>>) {
+        if self.done { return; }
+        self.done = true;
+        if let Some(map) = self.flight.inflight.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if map.get(&self.key).is_some_and(|e| std::sync::Arc::ptr_eq(e, &self.entry)) { map.remove(&self.key); }
+        }
+        *self.entry.state.lock().unwrap_or_else(|e| e.into_inner()) = FlightState::Done(blob);
+        self.entry.cv.notify_all();
+    }
+    fn finish(mut self, blob: Option<std::sync::Arc<Vec<u8>>>) { self.complete(blob); }
+}
+impl<K: Eq + std::hash::Hash + Copy> Drop for FlightGuard<'_, K> { fn drop(&mut self) { self.complete(None); } }
+static COMPUTE_FLIGHT: PsoFlight<(u64, usize, i32)> = PsoFlight::new();
+static GRAPHICS_FLIGHT: PsoFlight<(u64, usize)> = PsoFlight::new();
+fn caller_is_wanted() -> bool { !std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso")) || super::pso_async::build_is_wanted() }
+fn lookup_or_enter_flight<'a, K: Eq + std::hash::Hash + Copy>(flight: &'a PsoFlight<K>, key: K, ram_get: impl Fn(K) -> Option<std::sync::Arc<Vec<u8>>>, disk: Option<&std::path::Path>) -> (Option<std::sync::Arc<Vec<u8>>>, bool, Option<FlightGuard<'a, K>>) {
+    if let Some(b) = ram_get(key) { return (Some(b), false, None); }
+    if let Some(b) = disk.and_then(driver_cache::load) { return (Some(std::sync::Arc::new(b)), true, None); }
+    match flight.enter(key, caller_is_wanted()) {
+        FlightRole::Leader(g) => match ram_get(key) { Some(b) => { g.finish(Some(b.clone())); (Some(b), false, None) } None => (None, false, Some(g)) },
+        FlightRole::Follower(blob) => (blob, false, None),
+    }
+}
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     with_switch_fallback(|| translated_compute_pso_once(this, f, desc, riid, ppv))
 }
@@ -3875,23 +3940,21 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     // A program built again gets the driver's own result of its first build: a retail title
     // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
     let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
-    let mut cached = compute_blob(key);
-    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
+    // RAM cache, disk cache (`driver_cache`), or an in-flight compile of the same key
     let disk = driver_cache::path(&dxil, copy.Flags.0);
-    let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    let (cached, from_disk, mut flight) = lookup_or_enter_flight(&COMPUTE_FLIGHT, key, compute_blob, disk.as_deref());
     if let Some(b) = &cached {
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     // in the background, a few at a time and within the commit headroom the program asks for
     let record = crate::gpu::shader::fnv64(cs);
-    let (mut hr, mut in_driver) = driver_compile_identified(
+    let wanted = || super::pso_async::build_is_wanted() || flight.as_ref().is_some_and(FlightGuard::is_wanted);
+    let (mut hr, mut in_driver) = driver_compile_with_wanted(
         "compute",
         dxil.len(),
         gate_compute_driver_compile(cached.is_some()),
         Some((record, cached.is_some())),
+        wanted,
         || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
     );
     if hr < 0 && cached.is_some() {
@@ -3901,11 +3964,12 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             driver_cache::note(false, disk.as_deref());
         }
         copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-        let (retried, took) = driver_compile_identified(
+        let (retried, took) = driver_compile_with_wanted(
             "compute retry",
             dxil.len(),
             gate_compute_driver_compile(false),
             Some((record, false)),
+            wanted,
             || finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv),
         );
         hr = retried;
@@ -3913,12 +3977,10 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     }
     let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
     if hr >= 0 && !reused {
-        keep_compute_blob(key, *ppv, dxil.len());
-        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
-            driver_cache::keep(p, &b, in_driver);
-        }
-    } else if reused && from_disk {
-        driver_cache::note(true, None);
+        persist_fresh_blob(&COMPUTE_BLOBS, key, dxil.len(), COMPUTE_BLOB_MIN_DXIL, COMPUTE_BLOBS_MAX, disk.as_deref(), in_driver, flight.take(), || read_pso_cached_blob(*ppv));
+    } else {
+        drop(flight);
+        if reused && from_disk { driver_cache::note(true, None); }
     }
     if hr < 0 {
         // A huge program's verdict in the log itself: `note_translation_error` goes to the
@@ -3968,9 +4030,10 @@ pub(crate) mod driver_cache {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     /// builds shorter than this are not worth a file
-    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    pub(super) const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
     static HITS: AtomicU64 = AtomicU64::new(0);
     static STALE: AtomicU64 = AtomicU64::new(0);
+    static DEBUG_PRESERVED: AtomicU64 = AtomicU64::new(0);
     static STORED: AtomicU64 = AtomicU64::new(0);
 
     /// The file of the pipeline made from `dxil` with `flags`.
@@ -4000,12 +4063,18 @@ pub(crate) mod driver_cache {
         std::fs::read(p).ok().filter(|b| !b.is_empty())
     }
 
-    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
-    pub fn note(ok: bool, p: Option<&Path>) {
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped
+    /// (preserved when the D3D12 debug layer is active).
+    pub fn note(ok: bool, p: Option<&Path>) { note_with_debug_layer(ok, p, super::DEBUG_LAYER_ACTIVE.load(Ordering::Acquire)); }
+    pub(super) fn note_with_debug_layer(ok: bool, p: Option<&Path>, debug_layer: bool) {
         if ok {
             let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 crate::xlog_info!("D3D12.X: {n} compute pipelines made from the driver's blob of an earlier run (kept on disk)");
+            }
+        } else if debug_layer {
+            if DEBUG_PRESERVED.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("D3D12.X: D3D12 debug layer active – preserving on-disk driver blobs refused during this run");
             }
         } else {
             if let Some(p) = p {
@@ -4054,8 +4123,9 @@ pub(crate) mod driver_cache {
     }
 
     /// Keep `blob`, of a build that took `took`, for the next run.
-    pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
-        if took >= KEEP && write(p, blob) {
+    pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) { keep_with_debug_layer(p, blob, took, super::DEBUG_LAYER_ACTIVE.load(Ordering::Acquire)); }
+    pub(super) fn keep_with_debug_layer(p: &Path, blob: &[u8], took: std::time::Duration, debug_layer: bool) {
+        if !debug_layer && took >= KEEP && write(p, blob) {
             let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
             if n.is_power_of_two() {
                 crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
@@ -4216,20 +4286,20 @@ unsafe fn read_pso_cached_blob(pso: *mut c_void) -> Option<Vec<u8>> {
     (!bytes.is_empty()).then_some(bytes)
 }
 
-/// The driver's blob of the PSO just built (works on both adopted title PSOs and raw PC compute
-/// passes owned by `TwoPassPso`).
-unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || compute_blob(key).is_some() {
-        return;
+/// Read a freshly compiled PSO's blob once (when disk, RAM, or `PsoFlight` followers need it),
+/// cache in RAM independently of disk, wake followers, and persist slow builds to disk.
+#[allow(clippy::too_many_arguments)]
+fn persist_fresh_blob<K: Eq + std::hash::Hash + Copy>(cache: &Mutex<Option<(HashMap<K, std::sync::Arc<Vec<u8>>>, usize)>>, key: K, dxil_len: usize, min_dxil: usize, max_bytes: usize, disk: Option<&std::path::Path>, in_driver: std::time::Duration, flight: Option<FlightGuard<'_, K>>, read_blob: impl FnOnce() -> Option<Vec<u8>>) {
+    let want_disk = disk.is_some() && in_driver >= driver_cache::KEEP && !DEBUG_LAYER_ACTIVE.load(Ordering::Acquire);
+    let want_ram = dxil_len >= min_dxil && cache.lock().unwrap().as_ref().map_or(max_bytes > 0, |(m, total)| !m.contains_key(&key) && *total < max_bytes);
+    let blob = (want_disk || want_ram || flight.as_ref().is_some_and(FlightGuard::has_followers)).then(read_blob).flatten().filter(|b| !b.is_empty()).map(std::sync::Arc::new);
+    if let (true, Some(b)) = (want_ram, &blob) {
+        let mut g = cache.lock().unwrap();
+        let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
+        if !m.contains_key(&key) && *total + b.len() <= max_bytes { *total += b.len(); m.insert(key, b.clone()); }
     }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    let mut g = COMPUTE_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > COMPUTE_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
+    if let Some(g) = flight { g.finish(blob.clone()); }
+    if want_disk { if let (Some(p), Some(ref b)) = (disk, &blob) { driver_cache::keep(p, b, in_driver); } }
 }
 
 /// The driver's compiled form of translated graphics pipelines (`GetCachedBlob`),
@@ -4247,20 +4317,6 @@ fn forget_graphics_blob(key: (u64, usize)) {
             *total -= b.len();
         }
     }
-}
-
-unsafe fn keep_graphics_blob(key: (u64, usize), pso: *mut c_void, dxil_len: usize) {
-    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || graphics_blob(key).is_some() {
-        return;
-    }
-    let Some(bytes) = read_pso_cached_blob(pso) else { return };
-    let mut g = GRAPHICS_BLOBS.lock().unwrap();
-    let (m, total) = g.get_or_insert_with(|| (HashMap::new(), 0));
-    if bytes.is_empty() || *total + bytes.len() > GRAPHICS_BLOBS_MAX {
-        return;
-    }
-    *total += bytes.len();
-    m.insert(key, std::sync::Arc::new(bytes));
 }
 
 /// Deterministic FNV-1a digest of every field in a translated PC graphics PSO (shaders, static
@@ -4671,12 +4727,9 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
     }
     let bytes = vs_dxil.len() + ps_dxil.as_ref().map_or(0, Vec::len) + rect_gs.as_ref().map_or(0, Vec::len);
     let gkey = graphics_blob_key(&copy, &vs_dxil, ps_dxil.as_deref(), rect_gs.as_deref(), &samplers);
-    let mut cached = graphics_blob(gkey);
     let disk = driver_cache::graphics_path(gkey.0, gkey.1);
-    let from_disk = cached.is_none();
-    if from_disk {
-        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    let (cached, from_disk, mut flight) = lookup_or_enter_flight(&GRAPHICS_FLIGHT, gkey, graphics_blob, disk.as_deref());
+    let wanted = || super::pso_async::build_is_wanted() || flight.as_ref().is_some_and(FlightGuard::is_wanted);
     let build = create_graphics_pso_cached(
         &mut copy,
         cached.as_deref().map(Vec::as_slice),
@@ -4687,17 +4740,15 @@ unsafe fn translated_graphics_pso_once(this: *mut c_void, f: PsoFn, desc: *const
                 driver_cache::note(false, disk.as_deref());
             }
         },
-        |label, has_cached, f| driver_compile_identified(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), f),
+        |label, has_cached, f| driver_compile_with_wanted(label, bytes, gate_compute_driver_compile(has_cached), Some((ps_hash, has_cached)), wanted, f),
         |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv),
     );
     let hr = build.hr;
     if build.cache_eligible {
-        keep_graphics_blob(gkey, *ppv, bytes);
-        if let (Some(p), Some(b)) = (disk.as_deref(), graphics_blob(gkey)) {
-            driver_cache::keep(p, &b, build.in_driver);
-        }
-    } else if build.reused && from_disk {
-        driver_cache::note(true, None);
+        persist_fresh_blob(&GRAPHICS_BLOBS, gkey, bytes, COMPUTE_BLOB_MIN_DXIL, GRAPHICS_BLOBS_MAX, disk.as_deref(), build.in_driver, flight.take(), || read_pso_cached_blob(*ppv));
+    } else {
+        drop(flight);
+        if build.reused && from_disk { driver_cache::note(true, None); }
     }
     if hr < 0 {
         note_translation_error(format!(
@@ -5297,15 +5348,17 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
     let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
-    // the mesh pass and its compute pass: one turn for both
-    let bytes = stream.shader_bytes() + tp.cs.len();
+    // the mesh pass takes its turn alone; drop `_slot` before entering `COMPUTE_FLIGHT` for
+    // `tp.cs` so lock order is strictly `PsoFlight -> CompileSlots` everywhere
+    let bytes = stream.shader_bytes();
     let gate = bytes >= huge_pso_bytes() && std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
     let waited = std::time::Instant::now();
     let _slot = gate.then(|| big_compile_turn(compile_slots(bytes), || big_compile_commit_free(big_compile_headroom(bytes)), super::pso_async::build_is_wanted)).flatten();
     if gate {
         crate::xlog_info!("D3D12.X: two-pass {kind} PSO ({bytes} B DXIL) gated: {}, waited {} ms", _slot.is_some(), waited.elapsed().as_millis());
     }
-    let hr = driver_compile(kind, stream.shader_bytes(), false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
+    let hr = driver_compile(kind, bytes, false, || finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv));
+    drop(_slot);
     if hr < 0 {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
@@ -5315,20 +5368,17 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     cdesc.CS = bytecode(&tp.cs);
     // Reuse the compiled driver blob of the compute pass across all `(MS/GS, PS)` pipelines that
-    // share `tp.cs` (in memory and on disk), matching `translated_compute_pso_once`.
+    // share `tp.cs` (in memory, in flight, and on disk), matching `translated_compute_pso_once`.
     let ckey = compute_blob_key(&tp.cs, rs as usize, 0);
-    let mut ccached = compute_blob(ckey);
     let cdisk = driver_cache::path(&tp.cs, 0);
-    let cfrom_disk = ccached.is_none();
-    if cfrom_disk {
-        ccached = cdisk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
-    }
+    let (ccached, cfrom_disk, mut cflight) = lookup_or_enter_flight(&COMPUTE_FLIGHT, ckey, compute_blob, cdisk.as_deref());
     if let Some(b) = &ccached {
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
     }
     let iid = pc_iid(Kind::PipelineState);
     let mut compute: *mut c_void = std::ptr::null_mut();
-    let (mut hc, mut cin_driver) = driver_compile_identified("compute pass", tp.cs.len(), false, None, || {
+    let cwanted = || super::pso_async::build_is_wanted() || cflight.as_ref().is_some_and(FlightGuard::is_wanted);
+    let (mut hc, mut cin_driver) = driver_compile_with_wanted("compute pass", tp.cs.len(), gate_compute_driver_compile(ccached.is_some()), None, cwanted, || {
         driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
     });
     if hc < 0 && ccached.is_some() {
@@ -5338,7 +5388,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
         }
         cdesc.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
         compute = std::ptr::null_mut();
-        let (retried, took) = driver_compile_identified("compute pass retry", tp.cs.len(), false, None, || {
+        let (retried, took) = driver_compile_with_wanted("compute pass retry", tp.cs.len(), gate_compute_driver_compile(false), None, cwanted, || {
             driver_pso(fc, this, &cdesc as *const _ as *const c_void, &iid, &mut compute)
         });
         hc = retried;
@@ -5346,14 +5396,11 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let creused = hc >= 0 && ccached.is_some() && cdesc.CachedPSO.CachedBlobSizeInBytes != 0;
     if hc >= 0 && !creused && !compute.is_null() {
-        keep_compute_blob(ckey, compute, tp.cs.len());
-        if let (Some(p), Some(b)) = (cdisk.as_deref(), compute_blob(ckey)) {
-            driver_cache::keep(p, &b, cin_driver);
-        }
-    } else if creused && cfrom_disk {
-        driver_cache::note(true, None);
+        persist_fresh_blob(&COMPUTE_BLOBS, ckey, tp.cs.len(), COMPUTE_BLOB_MIN_DXIL, COMPUTE_BLOBS_MAX, cdisk.as_deref(), cin_driver, cflight.take(), || read_pso_cached_blob(compute));
+    } else {
+        drop(cflight);
+        if creused && cfrom_disk { driver_cache::note(true, None); }
     }
-    drop(_slot);
     if hc < 0 || compute.is_null() {
         note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
@@ -5977,7 +6024,10 @@ unsafe extern "system" fn alloc_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
-        super::alloc_pool::forget(this as usize);
+        let gone = super::alloc_pool::forget(this as usize);
+        let all: Vec<usize> = gone.free.iter().copied().chain(gone.busy.iter().map(|(b, _)| *b)).collect();
+        super::bind::on_allocator_release(&all);
+        super::console_list::retire_backings(&gone.free, gone.busy);
         super::list_x::on_allocator_release(this as usize);
     }
     n
@@ -5992,13 +6042,13 @@ pub(super) unsafe fn reset_pc_allocator(raw: *mut c_void) -> HRESULT {
 
 unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     // (lists may still hold recordings on it that the title submits again: `alloc_pool`)
-    let hr = match super::alloc_pool::title_reset(this) {
-        Some(hr) => hr,
-        None => reset_pc_allocator(this),
-    };
+    let res = super::alloc_pool::title_reset_with_backing(this);
+    let hr = res.hr.unwrap_or_else(|| reset_pc_allocator(this));
     if hr >= 0 {
-        // the GPU is done with what lists recorded from this allocator used
-        super::console_list::allocator_reset(this);
+        if let Some(b) = res.reset_backing {
+            // the GPU is done with what lists recorded on the reset PC backing used
+            super::console_list::allocator_reset(b as *mut c_void);
+        }
     }
     hr
 }
@@ -6196,6 +6246,10 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
     type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
+    if super::title_textures::is_own_work() {
+        f(this, n, lists);
+        return;
+    }
     if n == 0 || lists.is_null() {
         f(this, n, lists);
         stop_if_device_removed();
@@ -7163,5 +7217,155 @@ mod map_tests {
         // Explicit DEPTH_STENCIL subobject is always preserved regardless of DSVFormat.
         assert!(parse(None, Some(true)).DepthStencilState.DepthEnable.as_bool());
         assert!(!parse(Some(40), Some(false)).DepthStencilState.DepthEnable.as_bool());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{path::PathBuf, sync::Arc, time::{Duration, Instant}};
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!("xcl-pso-{tag}-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+    fn wait_followers<K: Eq + std::hash::Hash + Copy>(guard: &FlightGuard<'_, K>, need: usize) {
+        let start = Instant::now();
+        while guard.follower_count() < need { assert!(start.elapsed() < Duration::from_secs(5)); std::thread::yield_now(); }
+    }
+    fn spawn_follower(flight: &Arc<PsoFlight<u64>>, key: u64, wanted: bool) -> std::thread::JoinHandle<Option<Arc<Vec<u8>>>> {
+        let f = flight.clone();
+        std::thread::spawn(move || match f.enter(key, wanted) { FlightRole::Follower(b) => b, _ => panic!("expected follower") })
+    }
+
+    #[test]
+    fn pso_flight_coalesces_concurrent_builds_and_delivers_blob_to_followers() {
+        let flight = Arc::new(PsoFlight::<u64>::new());
+        let FlightRole::Leader(guard) = flight.enter(42, false) else { panic!("expected leader") };
+        let followers: Vec<_> = (0..3).map(|_| spawn_follower(&flight, 42, false)).collect();
+        wait_followers(&guard, 3);
+        match flight.enter(99, false) { FlightRole::Leader(g) => g.finish(None), _ => panic!("unrelated key must not block") }
+        guard.finish(Some(Arc::new(vec![1, 2, 3, 4])));
+        for t in followers { assert_eq!(t.join().unwrap().as_deref().map(Vec::as_slice), Some(&[1u8, 2, 3, 4][..])); }
+        assert!(matches!(flight.enter(42, false), FlightRole::Leader(_)));
+    }
+
+    #[test]
+    fn pso_flight_wakes_followers_on_failure_and_panic() {
+        let flight = Arc::new(PsoFlight::<u64>::new());
+        let FlightRole::Leader(guard) = flight.enter(1, false) else { panic!() };
+        let f1 = spawn_follower(&flight, 1, false);
+        wait_followers(&guard, 1);
+        drop(guard);
+        assert!(f1.join().unwrap().is_none() && matches!(flight.enter(1, false), FlightRole::Leader(_)));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let (f, b) = (flight.clone(), entered.clone());
+        let leader = std::thread::spawn(move || { let FlightRole::Leader(g) = f.enter(2, false) else { panic!() }; b.wait(); wait_followers(&g, 2); panic!("boom"); });
+        entered.wait();
+        let followers: Vec<_> = (0..2).map(|_| spawn_follower(&flight, 2, false)).collect();
+        assert!(leader.join().is_err());
+        for t in followers { assert!(t.join().unwrap().is_none(), "panic in leader must wake followers with None"); }
+        assert!(matches!(flight.enter(2, false), FlightRole::Leader(_)));
+    }
+
+    #[test]
+    fn pso_flight_propagates_wanted_from_follower_to_leader() {
+        let flight = Arc::new(PsoFlight::<u64>::new());
+        let FlightRole::Leader(guard) = flight.enter(7, false) else { panic!() };
+        assert!(!guard.is_wanted());
+        let f_bg = spawn_follower(&flight, 7, false);
+        wait_followers(&guard, 1);
+        assert!(!guard.is_wanted());
+        let f_fg = spawn_follower(&flight, 7, true);
+        wait_followers(&guard, 2);
+        assert!(guard.is_wanted());
+        guard.finish(Some(Arc::new(vec![9, 8])));
+        assert_eq!(f_bg.join().unwrap().as_deref().map(Vec::as_slice), Some(&[9u8, 8][..]));
+        assert_eq!(f_fg.join().unwrap().as_deref().map(Vec::as_slice), Some(&[9u8, 8][..]));
+    }
+
+    #[test]
+    fn slow_blob_persists_to_disk_even_when_below_ram_min_or_ram_cache_full() {
+        let dir = TempDir::new("persist");
+        let ram: Mutex<Option<(HashMap<u64, Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+        let (p_small, reads) = (dir.0.join("small.pso"), AtomicUsize::new(0));
+        persist_fresh_blob(&ram, 1, COMPUTE_BLOB_MIN_DXIL - 1, COMPUTE_BLOB_MIN_DXIL, 1024, Some(&p_small), driver_cache::KEEP, None, || { reads.fetch_add(1, Ordering::Relaxed); Some(vec![0xAA; 16]) });
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert!(ram.lock().unwrap().as_ref().is_none_or(|(m, _)| !m.contains_key(&1)));
+        assert_eq!(driver_cache::load(&p_small).as_deref(), Some(&[0xAAu8; 16][..]));
+        ram.lock().unwrap().get_or_insert_with(|| (HashMap::new(), 0)).1 = 32;
+        let flight = Arc::new(PsoFlight::<u64>::new());
+        let FlightRole::Leader(guard) = flight.enter(2, false) else { panic!() };
+        let follower = spawn_follower(&flight, 2, false);
+        wait_followers(&guard, 1);
+        let (p_full, reads2) = (dir.0.join("full.pso"), AtomicUsize::new(0));
+        persist_fresh_blob(&ram, 2, COMPUTE_BLOB_MIN_DXIL, COMPUTE_BLOB_MIN_DXIL, 32, Some(&p_full), driver_cache::KEEP, Some(guard), || { reads2.fetch_add(1, Ordering::Relaxed); Some(vec![0xBB; 20]) });
+        assert_eq!(reads2.load(Ordering::Relaxed), 1);
+        assert!(!ram.lock().unwrap().as_ref().unwrap().0.contains_key(&2));
+        assert_eq!(driver_cache::load(&p_full).as_deref(), Some(&[0xBBu8; 20][..]));
+        assert_eq!(follower.join().unwrap().as_deref().map(Vec::as_slice), Some(&[0xBBu8; 20][..]));
+    }
+
+    #[test]
+    fn driver_cache_preserves_blobs_when_debug_layer_is_active() {
+        let dir = TempDir::new("debug-layer");
+        let (p, p_new) = (dir.0.join("release.pso"), dir.0.join("debug-only.pso"));
+        driver_cache::keep_with_debug_layer(&p, b"release-blob", driver_cache::KEEP, false);
+        assert_eq!(driver_cache::load(&p).as_deref(), Some(b"release-blob".as_slice()));
+        driver_cache::note_with_debug_layer(false, Some(&p), true);
+        driver_cache::keep_with_debug_layer(&p, b"debug-blob", Duration::from_secs(5), true);
+        driver_cache::keep_with_debug_layer(&p_new, b"debug-blob", Duration::from_secs(5), true);
+        assert_eq!(driver_cache::load(&p).as_deref(), Some(b"release-blob".as_slice()));
+        assert!(!p_new.exists());
+        driver_cache::note_with_debug_layer(false, Some(&p), false);
+        assert!(!p.exists());
+    }
+}
+
+#[cfg(test)]
+mod own_work_tests {
+    use super::*;
+
+    #[test]
+    fn own_work_execute_command_lists_skips_title_queue_and_list_tracking() {
+        #[repr(C)]
+        struct MockQueue { vtable: *const usize, calls: usize, last_n: u32, last_list: usize }
+        unsafe extern "system" fn no_iface(_: *mut c_void, _: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+            if !ppv.is_null() { *ppv = std::ptr::null_mut(); }
+            E_NOINTERFACE
+        }
+        unsafe extern "system" fn ref_op(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn exec(this: *mut c_void, n: u32, lists: *const *mut c_void) {
+            let q = &mut *this.cast::<MockQueue>();
+            (q.calls, q.last_n, q.last_list) = (q.calls + 1, n, if n > 0 && !lists.is_null() { *lists as usize } else { 0 });
+        }
+        unsafe extern "system" fn get_desc(_: *mut c_void, out: *mut D3D12_COMMAND_QUEUE_DESC) -> *mut D3D12_COMMAND_QUEUE_DESC {
+            if !out.is_null() { *out = D3D12_COMMAND_QUEUE_DESC::default(); }
+            out
+        }
+        unsafe extern "system" fn noop() -> usize { 0 }
+        static VTABLE: std::sync::LazyLock<[usize; 20]> = std::sync::LazyLock::new(|| {
+            let mut v = [noop as usize; 20];
+            (v[0], v[1], v[2], v[7], v[10], v[18], v[19]) = (no_iface as usize, ref_op as usize, ref_op as usize, no_iface as usize, exec as usize, get_desc as usize, 1);
+            v
+        });
+        let mut mock = MockQueue { vtable: VTABLE.as_ptr(), calls: 0, last_n: 0, last_list: 0 };
+        let q_ptr = std::ptr::from_mut(&mut mock).cast::<c_void>();
+        let (q_raw, fake_list) = (q_ptr as usize, 0x7E57_2109_0000usize as *mut c_void);
+        let lists = [fake_list];
+        unsafe {
+            adopt(q_ptr, Kind::CommandQueue);
+            let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(*vt(q_ptr).add(10));
+            super::super::title_textures::own_work(|| f(q_ptr, 1, lists.as_ptr()));
+        }
+        assert_eq!((mock.calls, mock.last_n, mock.last_list), (1, 1, fake_list as usize));
+        assert!(!super::super::list_x::is_live_queue(q_raw) && !super::super::list_x::has_list_state(fake_list as usize));
+        assert!(!super::super::present::known_queues().contains(&q_raw));
     }
 }

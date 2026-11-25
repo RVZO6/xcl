@@ -44,10 +44,23 @@ impl Held {
         self.open.is_empty() && self.sealed.is_empty()
     }
 
+    fn needs_seal(&self, seal_now: bool) -> bool {
+        !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY))
+    }
+
+    unsafe fn drain_completed(&mut self) -> Vec<usize> {
+        let mut gone = Vec::new();
+        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
+            let dead = self.sealed.pop_front().unwrap().dead;
+            if gone.is_empty() { gone = dead; } else { gone.extend(dead); }
+        }
+        gone
+    }
+
     /// Close the open batch (at most every `SEAL_EVERY`, or `seal_now`) with a fence value on each of `queues`,
     /// and take out the batches every queue is past: the resources to release now.
     unsafe fn drain(&mut self, queues: &[ID3D12CommandQueue], seal_now: bool) -> Vec<usize> {
-        if !self.open.is_empty() && (seal_now || self.last_seal.is_none_or(|t| t.elapsed() >= SEAL_EVERY)) {
+        if self.needs_seal(seal_now) {
             let mut marks = Vec::with_capacity(queues.len());
             let mut ok = true;
             for q in queues {
@@ -76,11 +89,7 @@ impl Held {
                 self.sealed.push_back(Batch { dead, marks });
             }
         }
-        let mut gone = Vec::new();
-        while self.sealed.front().is_some_and(|b| b.marks.iter().all(|(f, v)| f.GetCompletedValue() >= *v)) {
-            gone.extend(self.sealed.pop_front().unwrap().dead);
-        }
-        gone
+        self.drain_completed()
     }
 }
 
@@ -95,21 +104,35 @@ pub fn enabled() -> bool {
 /// how long a last `Release` itself waits for queues with nothing to do to say so
 const IDLE_WAIT: Duration = Duration::from_micros(300);
 
+unsafe fn hold_with<F: FnMut() -> Vec<ID3D12CommandQueue>>(held: &Mutex<Option<Held>>, res: usize, collect_queues: F) -> bool {
+    let (gone, gpu_busy) = {
+        let mut g = held.lock().unwrap();
+        let h = g.get_or_insert_with(Held::default);
+        let gone = h.drain_completed();
+        h.open.push(res);
+        (gone, !h.sealed.is_empty())
+    };
+    release_all(gone);
+    if gpu_busy { return true; }
+    let start = Instant::now();
+    drain_with(held, true, collect_queues);
+    loop {
+        let (gone, sealed_empty, still_held) = held.lock().unwrap().as_mut().map_or((Vec::new(), true, false), |h| {
+            (h.drain_completed(), h.sealed.is_empty(), !h.is_empty())
+        });
+        release_all(gone);
+        if sealed_empty { return still_held; }
+        if start.elapsed() >= IDLE_WAIT { return true; }
+        std::hint::spin_loop();
+    }
+}
+
 /// `res` (an adopted resource) holds one reference that is now this module's. With no work in
 /// flight it goes before this returns (the queues pass a fence value at once): a title that
 /// frees the memory under a resource right after its last `Release` finds it unpinned, as
 /// before. Otherwise the thread here lets it go.
 pub unsafe fn hold(res: usize) {
-    HELD.lock().unwrap().get_or_insert_with(Held::default).open.push(res);
-    let start = Instant::now();
-    drain_known(true);
-    while start.elapsed() < IDLE_WAIT && HELD.lock().unwrap().as_ref().is_some_and(|h| !h.is_empty()) {
-        std::hint::spin_loop();
-        drain_known(false);
-    }
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
-    }
+    if !hold_with(&HELD, res, || unsafe { collect_known_queues() }) { return; }
     // A thread of its own lets the held ones go: the title may release a resource and then
     // wait for its memory without another submit (an imported heap pins the pages under its
     // resources – unmapping them stood still while one was held "until the next submit").
@@ -125,9 +148,10 @@ pub unsafe fn hold(res: usize) {
 /// Release what every queue XCL knows of is past: the title's, the tile-mapping one, the
 /// upload ones.
 pub unsafe fn drain_known(seal_now: bool) {
-    if HELD.lock().unwrap().as_ref().is_none_or(Held::is_empty) {
-        return;
-    }
+    drain_with(&HELD, seal_now, || unsafe { collect_known_queues() });
+}
+
+unsafe fn collect_known_queues() -> Vec<ID3D12CommandQueue> {
     let mut queues: Vec<ID3D12CommandQueue> = Vec::new();
     for raw in super::present::known_queues() {
         let raw = raw as *mut c_void;
@@ -137,10 +161,25 @@ pub unsafe fn drain_known(seal_now: bool) {
     }
     queues.extend(super::sparse::queue());
     queues.extend(super::title_textures::upload_queues());
-    let gone = match HELD.lock().unwrap().as_mut() {
-        Some(h) => h.drain(&queues, seal_now),
-        None => return,
+    queues
+}
+
+unsafe fn drain_with<F: FnMut() -> Vec<ID3D12CommandQueue>>(held: &Mutex<Option<Held>>, seal_now: bool, mut collect_queues: F) {
+    let (mut gone, need_seal) = {
+        let mut g = held.lock().unwrap();
+        let Some(h) = g.as_mut().filter(|h| !h.is_empty()) else { return };
+        (h.drain_completed(), h.needs_seal(seal_now))
     };
+    if need_seal {
+        let queues = collect_queues();
+        let more = held.lock().unwrap().as_mut().map_or_else(Vec::new, |h| h.drain(&queues, seal_now));
+        drop(queues);
+        if gone.is_empty() { gone = more; } else { gone.extend(more); }
+    }
+    release_all(gone);
+}
+
+unsafe fn release_all(gone: Vec<usize>) {
     // (outside the lock: a release may end other objects, whose releases come back here)
     for res in gone {
         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(super::real::orig_fn(res as *mut c_void, 2));
@@ -207,5 +246,134 @@ mod tests {
         held.open.push(0x1000);
         assert_eq!(unsafe { held.drain(&[], false) }, vec![0x1000]);
         assert!(held.is_empty());
+    }
+
+    use std::mem::{offset_of, size_of};
+    use std::sync::{atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering}, OnceLock};
+    use windows::core::{GUID, HRESULT};
+
+    #[repr(C)] struct FakeFence { vt: *const usize, completed: AtomicU64, signaled: AtomicU64, complete_after: AtomicU32, polls: AtomicU32 }
+    #[repr(C)] struct FakeDevice { vt: *const usize, fence: *const FakeFence }
+    #[repr(C)] struct FakeQueue { vt: *const usize, device: *const FakeDevice, signals: AtomicU32 }
+    #[repr(C)] struct FakeRes { vt: *const usize, held: *const Mutex<Option<Held>>, releases: AtomicU32, unlocked: AtomicBool }
+
+    extern "system" fn unexpected_call() { std::process::abort(); }
+    unsafe extern "system" fn fake_add_ref(_: *mut c_void) -> u32 { 2 }
+    unsafe extern "system" fn fake_release(_: *mut c_void) -> u32 { 1 }
+    unsafe extern "system" fn fake_fence_completed(this: *mut c_void) -> u64 {
+        let f = &*this.cast::<FakeFence>();
+        f.polls.fetch_add(1, Ordering::Relaxed);
+        if f.complete_after.load(Ordering::Relaxed) > 0 && f.complete_after.fetch_sub(1, Ordering::Relaxed) == 1 {
+            f.completed.store(f.signaled.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        f.completed.load(Ordering::Relaxed)
+    }
+    unsafe extern "system" fn fake_create_fence(this: *mut c_void, init: u64, _: D3D12_FENCE_FLAGS, _: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        let fence = (*this.cast::<FakeDevice>()).fence;
+        (*fence).completed.store(init, Ordering::Relaxed); *out = fence.cast_mut().cast(); HRESULT(0)
+    }
+    unsafe extern "system" fn fake_get_device(this: *mut c_void, _: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        *out = (*this.cast::<FakeQueue>()).device.cast_mut().cast(); HRESULT(0)
+    }
+    unsafe extern "system" fn fake_queue_signal(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+        (*this.cast::<FakeQueue>()).signals.fetch_add(1, Ordering::Relaxed);
+        (*fence.cast::<FakeFence>()).signaled.store(value, Ordering::Relaxed); HRESULT(0)
+    }
+    unsafe extern "system" fn fake_res_release(this: *mut c_void) -> u32 {
+        let r = &*this.cast::<FakeRes>();
+        r.unlocked.store((*r.held).try_lock().is_ok(), Ordering::Relaxed); r.releases.fetch_add(1, Ordering::Relaxed); 0
+    }
+    fn com_vt<const N: usize>(extra: &[(usize, usize)]) -> [usize; N] {
+        let mut v = [unexpected_call as usize; N];
+        (v[1], v[2]) = (fake_add_ref as usize, fake_release as usize);
+        for &(slot, f) in extra { v[slot] = f; }
+        v
+    }
+
+    struct FakeEnv { queue: Box<FakeQueue>, _device: Box<FakeDevice>, fence: Box<FakeFence>, collects: AtomicU32 }
+    impl FakeEnv {
+        fn new(complete_after: u32) -> Self {
+            const S: usize = size_of::<usize>();
+            type Vts = ([usize; size_of::<ID3D12Fence_Vtbl>() / S], [usize; size_of::<ID3D12Device_Vtbl>() / S], [usize; size_of::<ID3D12CommandQueue_Vtbl>() / S]);
+            static VTS: OnceLock<Vts> = OnceLock::new();
+            let (f_vt, d_vt, q_vt) = VTS.get_or_init(|| (
+                com_vt(&[(offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / S, fake_fence_completed as usize)]),
+                com_vt(&[(offset_of!(ID3D12Device_Vtbl, CreateFence) / S, fake_create_fence as usize)]),
+                com_vt(&[(offset_of!(ID3D12CommandQueue_Vtbl, base__.base__.GetDevice) / S, fake_get_device as usize), (offset_of!(ID3D12CommandQueue_Vtbl, Signal) / S, fake_queue_signal as usize)]),
+            ));
+            let fence = Box::new(FakeFence { vt: f_vt.as_ptr(), completed: AtomicU64::new(0), signaled: AtomicU64::new(0), complete_after: AtomicU32::new(complete_after), polls: AtomicU32::new(0) });
+            let device = Box::new(FakeDevice { vt: d_vt.as_ptr(), fence: &*fence });
+            let queue = Box::new(FakeQueue { vt: q_vt.as_ptr(), device: &*device, signals: AtomicU32::new(0) });
+            Self { queue, _device: device, fence, collects: AtomicU32::new(0) }
+        }
+        fn collect(&self) -> Vec<ID3D12CommandQueue> {
+            self.collects.fetch_add(1, Ordering::Relaxed);
+            let raw = (&*self.queue as *const FakeQueue).cast_mut().cast::<c_void>();
+            vec![unsafe { ID3D12CommandQueue::from_raw_borrowed(&raw).unwrap().clone() }]
+        }
+        fn stats(&self) -> (u32, u32) { (self.collects.load(Ordering::Relaxed), self.queue.signals.load(Ordering::Relaxed)) }
+    }
+    impl FakeRes {
+        fn new(held: &Mutex<Option<Held>>) -> Box<Self> {
+            static ORIG: OnceLock<[usize; 3]> = OnceLock::new();
+            static EXT: OnceLock<[usize; 4]> = OnceLock::new();
+            let ext = EXT.get_or_init(|| { let o = ORIG.get_or_init(|| [unexpected_call as usize, fake_add_ref as usize, fake_res_release as usize]); [o.as_ptr() as usize, o[0], o[1], o[2]] });
+            Box::new(Self { vt: unsafe { ext.as_ptr().add(1) }, held, releases: AtomicU32::new(0), unlocked: AtomicBool::new(false) })
+        }
+        fn ptr(&self) -> usize { self as *const Self as usize }
+        fn released_unlocked(&self) -> bool { self.releases.load(Ordering::Relaxed) == 1 && self.unlocked.load(Ordering::Relaxed) }
+    }
+
+    #[test]
+    fn drain_skips_queue_collection_when_no_seal_is_due() {
+        let env = FakeEnv::new(0);
+        let held = Mutex::new(None);
+        let (r1, r2) = (FakeRes::new(&held), FakeRes::new(&held));
+        held.lock().unwrap().get_or_insert_with(Held::default).open.push(r1.ptr());
+        unsafe { drain_with(&held, false, || env.collect()) };
+        assert_eq!(env.stats(), (1, 1));
+        unsafe { drain_with(&held, false, || env.collect()); drain_with(&held, true, || env.collect()); }
+        held.lock().unwrap().as_mut().unwrap().open.push(r2.ptr());
+        unsafe { drain_with(&held, false, || env.collect()) };
+        assert_eq!(env.stats(), (1, 1));
+        env.fence.completed.store(1, Ordering::Relaxed);
+        unsafe { drain_with(&held, false, || env.collect()) };
+        assert_eq!((env.stats(), r1.released_unlocked(), r2.releases.load(Ordering::Relaxed)), ((1, 1), true, 0));
+        unsafe { drain_with(&held, true, || env.collect()) };
+        assert_eq!(env.stats(), (2, 2));
+        env.fence.completed.store(2, Ordering::Relaxed);
+        unsafe { drain_with(&held, false, || env.collect()) };
+        assert_eq!((env.stats(), r2.released_unlocked()), ((2, 2), true));
+        assert!(held.lock().unwrap().as_ref().is_none_or(Held::is_empty));
+    }
+
+    #[test]
+    fn hold_batches_without_spinning_or_signaling_while_gpu_is_busy() {
+        let env = FakeEnv::new(0);
+        let held = Mutex::new(None);
+        let (r1, rest) = (FakeRes::new(&held), (0..16).map(|_| FakeRes::new(&held)).collect::<Vec<_>>());
+        assert!(unsafe { hold_with(&held, r1.ptr(), || env.collect()) });
+        assert_eq!((env.stats(), r1.releases.load(Ordering::Relaxed)), ((1, 1), 0));
+        let polls_before = env.fence.polls.load(Ordering::Relaxed);
+        for r in &rest { assert!(unsafe { hold_with(&held, r.ptr(), || env.collect()) }); }
+        assert_eq!((env.stats(), env.fence.polls.load(Ordering::Relaxed) - polls_before), ((1, 1), rest.len() as u32));
+        assert_eq!(held.lock().unwrap().as_ref().unwrap().open.len(), rest.len());
+        env.fence.completed.store(1, Ordering::Relaxed);
+        unsafe { drain_with(&held, true, || env.collect()) };
+        assert_eq!((env.stats(), r1.released_unlocked()), ((2, 2), true));
+        env.fence.completed.store(2, Ordering::Relaxed);
+        unsafe { drain_with(&held, false, || env.collect()) };
+        assert_eq!(env.stats(), (2, 2));
+        assert!(rest.iter().all(|r| r.released_unlocked()) && held.lock().unwrap().as_ref().is_none_or(Held::is_empty));
+    }
+
+    #[test]
+    fn hold_releases_synchronously_when_queues_are_idle_without_recollecting() {
+        let env = FakeEnv::new(2);
+        let held = Mutex::new(None);
+        let r = FakeRes::new(&held);
+        assert!(!unsafe { hold_with(&held, r.ptr(), || env.collect()) });
+        assert_eq!((env.stats(), env.fence.polls.load(Ordering::Relaxed), r.released_unlocked()), ((1, 1), 2, true));
+        assert!(held.lock().unwrap().as_ref().is_none_or(Held::is_empty));
     }
 }

@@ -7,9 +7,9 @@
 //! for at its first bind (a skipped dispatch would corrupt what it computes).
 //! `XCL_ASYNC_PSO=0` builds every pipeline in the call, as before.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 struct Pending {
     /// the build, until a worker – or a bind that cannot wait for the queue – takes it
@@ -146,11 +146,19 @@ pub fn title_held() -> bool {
     HELD.load(Ordering::Acquire) != 0
 }
 
+#[cfg(test)]
+thread_local! {
+    static HELD_ACQUIRES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TEST_WAIT_BUDGET: std::cell::Cell<Option<Option<std::time::Duration>>> = const { std::cell::Cell::new(None) };
+}
+
 /// A bind's wait for a pipeline still being built (`title_held`).
 struct Held;
 
 impl Held {
     fn new() -> Held {
+        #[cfg(test)]
+        HELD_ACQUIRES.with(|c| c.set(c.get() + 1));
         HELD.fetch_add(1, Ordering::AcqRel);
         Held
     }
@@ -169,18 +177,86 @@ pub fn enabled() -> bool {
 /// Builds the real pipeline: its raw pointer, 0 = failed.
 pub type Job = Box<dyn FnOnce() -> usize + Send>;
 
-fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
-    static Q: OnceLock<Mutex<mpsc::Sender<Arc<Pending>>>> = OnceLock::new();
-    Q.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<Arc<Pending>>();
-        let rx = Arc::new(Mutex::new(rx));
-        // translation recurses deeply on big programs; DXC itself runs on its own pool
-        let n = crate::gpu::recomp::dxc::compile_threads();
+#[derive(Default)]
+struct QueueState {
+    wanted_gfx: VecDeque<Arc<Pending>>,
+    wanted_cs: VecDeque<Arc<Pending>>,
+    gfx: VecDeque<Arc<Pending>>,
+    cs: VecDeque<Arc<Pending>>,
+    active_compute: usize,
+    max_compute: usize,
+    closed: bool,
+}
+
+struct WorkQueue { state: Mutex<QueueState>, cv: Condvar }
+struct ComputeSlotGuard<'a>(&'a WorkQueue);
+
+impl Drop for ComputeSlotGuard<'_> {
+    fn drop(&mut self) {
+        { let mut g = self.0.state.lock().unwrap_or_else(|e| e.into_inner()); g.active_compute = g.active_compute.saturating_sub(1); }
+        self.0.cv.notify_all();
+    }
+}
+
+fn pop_live(deque: &mut VecDeque<Arc<Pending>>) -> Option<Arc<Pending>> {
+    while let Some(p) = deque.pop_front() {
+        if !p.orphan.load(Ordering::Acquire) && p.real.load(Ordering::Acquire) == 0 { return Some(p); }
+    }
+    None
+}
+
+impl WorkQueue {
+    fn new(workers: usize) -> Self {
+        let graphics_reserve = if workers >= 8 { 2 } else if workers >= 2 { 1 } else { 0 };
+        let max_compute = workers.saturating_sub(graphics_reserve).max(1);
+        Self { state: Mutex::new(QueueState { max_compute, ..Default::default() }), cv: Condvar::new() }
+    }
+    fn push(&self, p: Arc<Pending>, wanted: bool) {
+        let mut g = self.state.lock().unwrap();
+        match (p.compute, wanted) {
+            (false, true) => g.wanted_gfx.push_back(p),
+            (true, true) => g.wanted_cs.push_back(p),
+            (false, false) => g.gfx.push_back(p),
+            (true, false) => g.cs.push_back(p),
+        }
+        drop(g);
+        self.cv.notify_one();
+    }
+    fn promote(&self, p: Arc<Pending>) {
+        let mut g = self.state.lock().unwrap();
+        if p.compute { g.wanted_cs.push_back(p); } else { g.wanted_gfx.push_back(p); }
+        drop(g);
+        self.cv.notify_all();
+    }
+    fn pop(&self) -> Option<(Arc<Pending>, Option<ComputeSlotGuard<'_>>)> {
+        let mut g = self.state.lock().unwrap();
+        loop {
+            if let Some(p) = pop_live(&mut g.wanted_gfx) { return Some((p, None)); }
+            if let Some(p) = (g.active_compute < g.max_compute).then(|| pop_live(&mut g.wanted_cs)).flatten() {
+                g.active_compute += 1; return Some((p, Some(ComputeSlotGuard(self))));
+            }
+            if let Some(p) = pop_live(&mut g.gfx) { return Some((p, None)); }
+            if let Some(p) = (g.active_compute < g.max_compute).then(|| pop_live(&mut g.cs)).flatten() {
+                g.active_compute += 1; return Some((p, Some(ComputeSlotGuard(self))));
+            }
+            if g.closed { return None; }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+    #[cfg(test)]
+    fn close(&self) { self.state.lock().unwrap().closed = true; self.cv.notify_all(); }
+}
+
+fn queue() -> &'static WorkQueue {
+    static Q: OnceLock<WorkQueue> = OnceLock::new();
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    // translation recurses deeply on big programs; DXC itself runs on its own pool
+    let n = crate::gpu::recomp::dxc::compile_threads();
+    let q = Q.get_or_init(|| WorkQueue::new(n));
+    STARTED.call_once(|| {
         for k in 0..n {
-            let rx = rx.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-{k}")).stack_size(64 << 20).spawn(move || loop {
-                let next = rx.lock().unwrap().recv();
-                let Ok(p) = next else { return };
+                let Some((p, _guard)) = q.pop() else { return };
                 // (None: a bind took it and builds it itself)
                 let job = p.job.lock().unwrap().take();
                 if let Some(job) = job {
@@ -188,8 +264,8 @@ fn queue() -> &'static Mutex<mpsc::Sender<Arc<Pending>>> {
                 }
             });
         }
-        Mutex::new(tx)
-    })
+    });
+    q
 }
 
 /// Release a pipeline state XCL owns (raw pointer, 0 = none).
@@ -240,11 +316,10 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
         crate::xlog_info!("D3D12.X: pipelines whose shaders are not compiled yet get a stand-in and are built in the background");
     });
     if send {
-        let _ = queue().lock().unwrap().send(p);
+        queue().push(p, false);
     } else if used::known(key) {
         if let Some(q) = preload() {
-            q.list.lock().unwrap().push_back(p);
-            q.cv.notify_one();
+            q.push(p);
         }
     }
 }
@@ -333,24 +408,63 @@ mod used {
 /// (`XCL_PSO_PRELOAD=0`: off). Apart from the ones a bind sends to (`queue`) and at the lowest
 /// priority: a pipeline that is bound is not held up by the ones made ahead (whoever takes
 /// `job` first builds it), and the title's own threads are not either.
-struct Preload {
-    list: Mutex<std::collections::VecDeque<Arc<Pending>>>,
-    cv: Condvar,
+#[derive(Default)]
+struct PreloadState {
+    graphics: VecDeque<Arc<Pending>>,
+    compute: VecDeque<Arc<Pending>>,
+    active_compute: usize,
+    max_compute: usize,
+    closed: bool,
+}
+
+struct Preload { state: Mutex<PreloadState>, cv: Condvar }
+struct PreloadComputeGuard<'a>(&'a Preload);
+
+impl Drop for PreloadComputeGuard<'_> {
+    fn drop(&mut self) {
+        { let mut g = self.0.state.lock().unwrap_or_else(|e| e.into_inner()); g.active_compute = g.active_compute.saturating_sub(1); }
+        self.0.cv.notify_all();
+    }
+}
+
+impl Preload {
+    fn new(workers: usize) -> Self {
+        Self { state: Mutex::new(PreloadState { max_compute: workers.saturating_sub(1).max(1), ..Default::default() }), cv: Condvar::new() }
+    }
+    fn push(&self, p: Arc<Pending>) {
+        let mut g = self.state.lock().unwrap();
+        if p.compute { g.compute.push_back(p); } else { g.graphics.push_back(p); }
+        drop(g);
+        self.cv.notify_one();
+    }
+    fn pop(&self) -> Option<(Arc<Pending>, Option<PreloadComputeGuard<'_>>)> {
+        let mut g = self.state.lock().unwrap();
+        loop {
+            if let Some(p) = pop_live(&mut g.graphics) { return Some((p, None)); }
+            if let Some(p) = (g.active_compute < g.max_compute).then(|| pop_live(&mut g.compute)).flatten() {
+                g.active_compute += 1; return Some((p, Some(PreloadComputeGuard(self))));
+            }
+            if g.closed { return None; }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+    #[cfg(test)]
+    fn close(&self) { self.state.lock().unwrap().closed = true; self.cv.notify_all(); }
 }
 
 fn preload() -> Option<&'static Preload> {
     static Q: OnceLock<Option<Preload>> = OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
+    let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
     let q = Q
         .get_or_init(|| {
             if std::env::var("XCL_PSO_PRELOAD").is_ok_and(|v| v.trim() == "0") {
                 return None;
             }
-            Some(Preload { list: Mutex::new(Default::default()), cv: Condvar::new() })
+            Some(Preload::new(n))
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let n = (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         for k in 0..n {
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 unsafe {
@@ -358,16 +472,7 @@ fn preload() -> Option<&'static Preload> {
                     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_LOWEST);
                 }
                 static DONE: AtomicUsize = AtomicUsize::new(0);
-                loop {
-                    let p = {
-                        let mut g = q.list.lock().unwrap();
-                        loop {
-                            if let Some(p) = g.pop_front() {
-                                break p;
-                            }
-                            g = q.cv.wait(g).unwrap();
-                        }
-                    };
+                while let Some((p, _guard)) = q.pop() {
                     // (released by the title meanwhile)
                     if p.orphan.load(Ordering::Acquire) {
                         continue;
@@ -391,6 +496,7 @@ fn preload() -> Option<&'static Preload> {
 #[cfg(test)]
 mod used_tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// While a bind waits for a pipeline still being built, the title is held (`title_held`):
     /// `kernelx::Sleep` does not count that time.
@@ -527,13 +633,23 @@ pub fn resolve(pso: usize) -> usize {
         0 => {
             // a lazy one is wanted now: to the workers
             if !p.sent.swap(true, Ordering::AcqRel) {
-                let _ = queue().lock().unwrap().send(p);
+                queue().push(p, false);
             }
             pso
         }
         r => r,
     }
 }
+
+/// Atomic outcome of waiting for a pipeline's background build (`resolve_wait_checked`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolveOutcome { Untracked(usize), Ready(usize), Pending, Failed }
+
+fn outcome_when_done(p: &Pending) -> ResolveOutcome {
+    match p.real.load(Ordering::Acquire) { 0 => ResolveOutcome::Failed, r => ResolveOutcome::Ready(r) }
+}
+
+pub fn resolve_wait_checked(pso: usize) -> ResolveOutcome { resolve_wait_for_checked(pso, wait_budget()) }
 
 /// `resolve`, waiting for a pipeline still being built – built here if no worker has started
 /// it yet (a queue of a title's hundreds of pipelines must not hold up the one it binds now).
@@ -543,26 +659,39 @@ pub fn resolve_wait(pso: usize) -> usize {
 
 /// `resolve_wait`, waiting at most `budget` (None: until the pipeline is built).
 fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
-    let Some(p) = entry(pso) else { return pso };
+    match resolve_wait_for_checked(pso, budget) { ResolveOutcome::Ready(r) | ResolveOutcome::Untracked(r) => r, ResolveOutcome::Pending | ResolveOutcome::Failed => pso }
+}
+
+fn resolve_wait_for_checked(pso: usize, budget: Option<std::time::Duration>) -> ResolveOutcome {
+    let Some(p) = entry(pso) else { return ResolveOutcome::Untracked(pso) };
     p.note_use();
-    // (the title's thread is held from here until the pipeline is built or the budget is over)
-    let _held = (!*p.done.lock().unwrap()).then(Held::new);
-    if let Some(budget) = budget {
-        return resolve_within(&p, pso, budget);
-    }
+    resolve_pending_for(&p, budget)
+}
+
+fn resolve_pending_for(p: &Arc<Pending>, budget: Option<std::time::Duration>) -> ResolveOutcome {
+    let done = p.done.lock().unwrap();
+    if *done { return outcome_when_done(p); }
+    drop(done);
+    if let Some(budget) = budget { return resolve_within(p, budget); }
+    let _held = Held::new();
     let job = p.job.lock().unwrap().take();
     if let Some(job) = job {
-        complete(&p, job());
+        complete(p, job());
     }
     p.want();
     let mut done = p.done.lock().unwrap();
     while !*done {
         done = p.cv.wait(done).unwrap();
     }
-    match p.real.load(Ordering::Acquire) {
-        0 => pso,
-        r => r,
-    }
+    outcome_when_done(p)
+}
+
+#[cfg(test)]
+pub(super) fn with_test_wait_budget<R>(budget: Option<std::time::Duration>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<Option<std::time::Duration>>);
+    impl Drop for Reset { fn drop(&mut self) { TEST_WAIT_BUDGET.with(|b| b.set(self.0)); } }
+    let _reset = Reset(TEST_WAIT_BUDGET.with(|b| b.replace(Some(budget))));
+    f()
 }
 
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
@@ -570,6 +699,8 @@ fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) -> usize {
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
 /// has been held 30 s.
 fn wait_budget() -> Option<std::time::Duration> {
+    #[cfg(test)]
+    if let Some(budget) = TEST_WAIT_BUDGET.with(|b| b.get()) { return budget; }
     static B: OnceLock<Option<std::time::Duration>> = OnceLock::new();
     *B.get_or_init(|| std::env::var("XCL_PSO_WAIT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).filter(|&ms| ms > 0).map(std::time::Duration::from_millis))
 }
@@ -577,24 +708,25 @@ fn wait_budget() -> Option<std::time::Duration> {
 /// `resolve_wait` for at most `budget`: the build goes to the workers (not this thread), and a
 /// pipeline not built by then is `late` – it and later binds of it get the stand-in (their
 /// dispatches are skipped) until a worker has built it.
-fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> usize {
-    let built = |p: &Pending| match p.real.load(Ordering::Acquire) {
-        0 => pso,
-        r => r,
-    };
-    if *p.done.lock().unwrap() {
-        return built(p);
-    }
-    if !p.sent.swap(true, Ordering::AcqRel) {
-        let _ = queue().lock().unwrap().send(p.clone());
-    }
+fn resolve_within(p: &Arc<Pending>, budget: std::time::Duration) -> ResolveOutcome {
+    let newly_sent = !p.sent.swap(true, Ordering::AcqRel);
     if p.late.load(Ordering::Acquire) {
-        return pso;
+        if newly_sent {
+            queue().push(p.clone(), false);
+        }
+        return ResolveOutcome::Pending;
     }
+    // (the title's thread is held from here until the pipeline is built or the budget is over)
+    let _held = Held::new();
     p.want();
+    if newly_sent {
+        queue().push(p.clone(), true);
+    } else {
+        queue().promote(p.clone());
+    }
     let (done, _) = p.cv.wait_timeout_while(p.done.lock().unwrap(), budget, |d| !*d).unwrap();
     if *done {
-        return built(p);
+        return outcome_when_done(p);
     }
     drop(done);
     p.late.store(true, Ordering::Release);
@@ -603,7 +735,7 @@ fn resolve_within(p: &Arc<Pending>, pso: usize, budget: std::time::Duration) -> 
     if n < 16 || n.is_power_of_two() {
         crate::xlog_warn!("D3D12.X: a pipeline still being built after {} ms: its binds go on without it until it is built ({} so far)", budget.as_millis(), n + 1);
     }
-    pso
+    ResolveOutcome::Pending
 }
 
 /// For binding: compute pipelines are waited for, graphics ones are not.
@@ -639,4 +771,155 @@ pub fn is_pending(pso: usize) -> bool {
 pub fn counts() -> (usize, usize, usize) {
     let pending = PENDING.lock().unwrap().as_ref().map_or(0, |m| m.values().filter(|p| !*p.done.lock().unwrap()).count());
     (BUILT.load(Ordering::Relaxed), FAILED.load(Ordering::Relaxed), pending)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{sync::mpsc, time::Duration};
+
+    fn test_pending(compute: bool, key: u64, job: Option<Job>) -> Arc<Pending> {
+        Arc::new(Pending {
+            job: Mutex::new(job), sent: std::sync::atomic::AtomicBool::new(true), real: AtomicUsize::new(0),
+            done: Mutex::new(false), cv: Condvar::new(), compute, key, used: Default::default(),
+            orphan: Default::default(), late: Default::default(), demand: Default::default(),
+        })
+    }
+
+    #[test]
+    fn wanted_job_preempts_queued_background_jobs() {
+        let q = WorkQueue::new(4);
+        let gfx2 = test_pending(false, 2, None);
+        for (c, k, w) in [(true, 3, false), (false, 1, false), (true, 4, false), (true, 5, true)] { q.push(test_pending(c, k, None), w); }
+        q.push(gfx2.clone(), false);
+        q.promote(gfx2);
+        let (p, g) = q.pop().unwrap();
+        assert_eq!((p.key, g.is_none()), (2, true));
+        p.real.store(2, Ordering::Release);
+        for (k, cs) in [(5, true), (1, false), (3, true), (4, true)] { let (p, g) = q.pop().unwrap(); assert_eq!((p.key, g.is_some()), (k, cs)); }
+        q.close();
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn graphics_jobs_do_not_starve_when_compute_workers_are_wedged() {
+        for (w, cap) in [(1, 1), (2, 1), (4, 3), (8, 6)] { assert_eq!(WorkQueue::new(w).state.lock().unwrap().max_compute, cap); }
+        let q = Arc::new(WorkQueue::new(4));
+        let ((cs_tx, cs_rx), (gfx_tx, gfx_rx)) = (mpsc::channel(), mpsc::channel());
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let workers: Vec<_> = (0..4).map(|_| {
+            let q = q.clone();
+            std::thread::spawn(move || while let Some((p, _g)) = q.pop() { if let Some(j) = p.job.lock().unwrap().take() { let _ = j(); } })
+        }).collect();
+        for id in 1..=4u64 {
+            let (tx, gate) = (cs_tx.clone(), gate.clone());
+            q.push(test_pending(true, id, Some(Box::new(move || {
+                let _ = tx.send(id);
+                let mut open = gate.0.lock().unwrap();
+                while !*open { open = gate.1.wait(open).unwrap(); }
+                id as usize
+            }))), false);
+        }
+        for _ in 0..3 { cs_rx.recv_timeout(Duration::from_secs(5)).expect("3 compute workers start"); }
+        for id in 10..13u64 { let tx = gfx_tx.clone(); q.push(test_pending(false, id, Some(Box::new(move || { let _ = tx.send(id); id as usize }))), false); }
+        for _ in 0..3 { gfx_rx.recv_timeout(Duration::from_secs(5)).expect("graphics runs on reserved lane"); }
+        assert!(cs_rx.try_recv().is_err(), "4th compute waits while max_compute is wedged");
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        cs_rx.recv_timeout(Duration::from_secs(5)).expect("4th compute runs once slot frees");
+        q.close();
+        for w in workers { w.join().unwrap(); }
+    }
+
+    #[test]
+    fn orphaned_job_is_skipped_in_work_queue() {
+        let q = WorkQueue::new(2);
+        let (ow, oc, done, late_oc) = (test_pending(false, 1, None), test_pending(true, 2, None), test_pending(false, 3, None), test_pending(true, 4, None));
+        ow.orphan.store(true, Ordering::Release);
+        oc.orphan.store(true, Ordering::Release);
+        done.real.store(3, Ordering::Release);
+        for (p, w) in [(ow, true), (oc, true), (done, false), (test_pending(false, 5, None), false), (late_oc.clone(), false), (test_pending(true, 6, None), false)] { q.push(p, w); }
+        late_oc.orphan.store(true, Ordering::Release);
+        for (k, cs) in [(5, false), (6, true)] { let (p, g) = q.pop().unwrap(); assert_eq!((p.key, g.is_some()), (k, cs)); }
+        q.close();
+        assert!(q.pop().is_none());
+        assert_eq!(q.state.lock().unwrap().active_compute, 0);
+    }
+
+    #[test]
+    fn preload_drains_graphics_before_compute_and_reserves_graphics_lane() {
+        let preload = Arc::new(Preload::new(2));
+        let orphan = test_pending(false, 99, None);
+        orphan.orphan.store(true, Ordering::Release);
+        for p in [test_pending(true, 1, None), orphan, test_pending(false, 2, None), test_pending(true, 3, None)] { preload.push(p); }
+        assert_eq!(preload.pop().unwrap().0.key, 2);
+        let (p, cs_guard) = preload.pop().unwrap();
+        assert_eq!((p.key, cs_guard.is_some()), (1, true));
+        let (tx, rx) = mpsc::channel();
+        let p2 = preload.clone();
+        let worker = std::thread::spawn(move || while let Some((item, _g)) = p2.pop() { let _ = tx.send(item.key); });
+        preload.push(test_pending(false, 4, None));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("graphics preload runs while compute slot held"), 4);
+        assert!(rx.try_recv().is_err(), "2nd compute preload waits while max_compute is active");
+        drop(cs_guard);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).expect("compute preload wakes when slot frees"), 3);
+        preload.close();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn compute_slot_guard_releases_slot_on_panic() {
+        let q = WorkQueue::new(2);
+        for k in [1, 2] { q.push(test_pending(true, k, None), false); }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (p, _g) = q.pop().unwrap();
+            assert_eq!((p.key, q.state.lock().unwrap().active_compute), (1, 1));
+            panic!("worker panic");
+        })).is_err());
+        assert_eq!(q.state.lock().unwrap().active_compute, 0);
+        assert_eq!(q.pop().unwrap().0.key, 2);
+
+        let preload = Preload::new(2);
+        for k in [10, 11] { preload.push(test_pending(true, k, None)); }
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (p, _g) = preload.pop().unwrap();
+            assert_eq!((p.key, preload.state.lock().unwrap().active_compute), (10, 1));
+            panic!("preload panic");
+        })).is_err());
+        assert_eq!(preload.state.lock().unwrap().active_compute, 0);
+        assert_eq!(preload.pop().unwrap().0.key, 11);
+    }
+
+    #[test]
+    fn resolve_wait_checked_distinguishes_untracked_ready_pending_and_failed() {
+        let (untracked, ready, pending, failed) = (0x7E57_C001usize, 0x7E57_C002usize, 0x7E57_C003usize, 0x7E57_C004usize);
+        assert_eq!((resolve_wait_checked(untracked), resolve_wait_checked(0)), (ResolveOutcome::Untracked(untracked), ResolveOutcome::Untracked(0)));
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        submit_lazy(ready, false, Box::new(|| 0x7E57_C101), 0);
+        submit_lazy(failed, false, Box::new(|| 0), 0);
+        submit_lazy(pending, false, Box::new(move || { let _ = go_rx.recv_timeout(Duration::from_secs(5)); 0 }), 0);
+        assert_eq!((resolve_wait_for_checked(ready, None), resolve_wait_for_checked(ready, Some(Duration::from_millis(5))), resolve_wait(ready)), (ResolveOutcome::Ready(0x7E57_C101), ResolveOutcome::Ready(0x7E57_C101), 0x7E57_C101));
+        assert_eq!((resolve_wait_for_checked(failed, None), resolve_wait_for_checked(failed, Some(Duration::from_millis(5))), resolve_wait(failed)), (ResolveOutcome::Failed, ResolveOutcome::Failed, failed));
+        assert_eq!(with_test_wait_budget(Some(Duration::from_millis(5)), || resolve_wait_checked(pending)), ResolveOutcome::Pending);
+        assert!(is_pending(pending));
+        for k in [ready, failed, pending] { let _ = released(k); }
+        let _ = go_tx.send(());
+        assert_eq!(resolve_wait_checked(ready), ResolveOutcome::Untracked(ready));
+    }
+
+    #[test]
+    fn late_pipeline_does_not_hold_title_on_subsequent_binds() {
+        let (p, held) = (test_pending(true, 0, None), || HELD_ACQUIRES.with(|c| c.get()));
+        let b = held();
+        assert_eq!(resolve_pending_for(&p, Some(Duration::from_millis(1))), ResolveOutcome::Pending);
+        assert_eq!((held(), p.late.load(Ordering::Acquire)), (b + 1, true));
+        let (b, t) = (held(), std::time::Instant::now());
+        assert_eq!(resolve_pending_for(&p, Some(Duration::from_secs(10))), ResolveOutcome::Pending);
+        assert_eq!(held(), b, "late pipeline must not construct Held");
+        assert!(t.elapsed() < Duration::from_secs(1));
+        complete(&p, 0x7E57_C201);
+        let b = held();
+        assert_eq!(resolve_pending_for(&p, Some(Duration::from_secs(10))), ResolveOutcome::Ready(0x7E57_C201));
+        assert_eq!(held(), b, "completed pipeline must not construct Held");
+    }
 }

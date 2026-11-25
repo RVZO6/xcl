@@ -655,10 +655,53 @@ impl Lw {
         Ok(())
     }
 
+    /// Host-side IEEE-754 binary32 → binary16 (RNE), bit-exact with [`Lw::f32_to_f16_rm`] at `rm = 0`.
+    fn f32_to_f16_rne_bits(x: u32) -> u32 {
+        let sign = (x >> 16) & 0x8000;
+        let ax = x & 0x7FFF_FFFF;
+        let sub_h = (f32::from_bits(ax) + 0.5f32).to_bits().wrapping_sub(0x3F00_0000);
+        let lsb = ax >> 13;
+        let norm_h = (ax.wrapping_add(0xC800_0FFF).wrapping_add(lsb & 1) >> 13).min(0x7C00);
+        let fin = if ax < 0x3880_0000 { sub_h } else { norm_h };
+        let nan_h = (lsb & 0x01FF) | 0x7E00;
+        sign | if ax > 0x7F80_0000 { nan_h } else { fin }
+    }
+
     /// `f32_to_f16_rm(f, 0)`: binary32 → binary16, round to nearest even (software).
+    ///
+    /// Specialized 21-instruction exact IEEE-754 RNE lowering:
+    /// - subnormals/zero (`|f| < 2^-14`): `bits(|f| + 0.5f) - 0x3F00_0000` (unflagged `fadd` is
+    ///   exact RNE in D3D12 with `0.5f` ULP = `2^-24` = f16 subnormal ULP; matches FTZ and rollover).
+    /// - normals/overflow/Inf: `umin(((ax + 0xC800_0FFF) + ((ax >> 13) & 1)) >> 13, 0x7C00)`.
+    /// - NaN: sign-preserving qNaN `sign | (((ax >> 13) & 0x01FF) | 0x7E00)` matching `f32_to_f16_rm`.
     pub fn f32_to_f16_rne(&mut self, f: Value) -> Value {
-        let z = self.c(0);
-        self.f32_to_f16_rm(f, z)
+        let x = self.bits(f);
+        if let Some(bits) = self.s.m.const_u64(x) {
+            return self.c(Self::f32_to_f16_rne_bits(bits as u32));
+        }
+        let sign = self.lshrc(x, 16);
+        let sign = self.andc(sign, 0x8000);
+        let ax = self.andc(x, 0x7FFF_FFFF);
+        let f_abs = self.f(ax);
+        let half = self.fc(0.5);
+        let sum = self.fadd(f_abs, half);
+        let sum_bits = self.bits(sum);
+        let k3f00 = self.c(0x3F00_0000);
+        let sub_h = self.sub(sum_bits, k3f00);
+        let lsb = self.lshrc(ax, 13);
+        let biased = self.addc(ax, 0xC800_0FFF);
+        let odd = self.andc(lsb, 1);
+        let rounded = self.add(biased, odd);
+        let norm_raw = self.lshrc(rounded, 13);
+        let k7c00 = self.c(0x7C00);
+        let norm_h = self.umin(norm_raw, k7c00);
+        let is_sub = self.cmpc(Pred::ULt, ax, 0x3880_0000);
+        let fin = self.sel(is_sub, sub_h, norm_h);
+        let is_nan = self.cmpc(Pred::UGt, ax, 0x7F80_0000);
+        let pl = self.andc(lsb, 0x01FF);
+        let nan_h = self.orc(pl, 0x7E00);
+        let mag = self.sel(is_nan, nan_h, fin);
+        self.or(sign, mag)
     }
 
     /// `f32_to_f16_rm`: binary32 → binary16 under MODE[3:2] `rm` (0 RNE, 1 +inf, 2 -inf, 3 RTZ).
@@ -857,17 +900,20 @@ impl Lw {
                 }
             }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
-                let p = if name == "v_mad_u64_u32" {
-                    let (x, y) = (self.zext64(lh[0].0), self.zext64(lh[1].0));
-                    self.mul(x, y)
+                let (p_hi, p_lo) = if name == "v_mad_u64_u32" {
+                    self.s.umul_wide(lh[0].0, lh[1].0)
                 } else {
-                    let (x, y) = (self.sext64(lh[0].0), self.sext64(lh[1].0));
-                    self.mul(x, y)
+                    self.s.imul_wide(lh[0].0, lh[1].0)
                 };
-                let c = u64v(self, 2);
-                let w = self.add(p, c);
-                let (lo, hi) = self.unpack64(w);
-                let carry = self.cmp64("lt", false, (lo, hi), lh[2]).expect("lt");
+                let (c_lo, c_hi) = lh[2];
+                let lo = self.add(p_lo, c_lo);
+                let c0 = self.cmp(Pred::ULt, lo, c_lo);
+                let hi1 = self.add(p_hi, c_hi);
+                let c1 = self.cmp(Pred::ULt, hi1, c_hi);
+                let c0u = self.u(c0);
+                let hi = self.add(hi1, c0u);
+                let c2 = self.cmp(Pred::ULt, hi, hi1);
+                let carry = self.lor(c1, c2);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
                 self.write_mask(&sdst, carry);
                 self.write64(&dst, lo, hi);
@@ -1338,5 +1384,128 @@ mod cmp64_tests {
         validate::validate(&dxil).expect("dxil validate");
         let dis = validate::disassemble(&dxil).expect("dxil disassemble");
         assert!(!dis.lines().any(|l| l.contains("icmp ") && l.contains(" i64 ")), "found i64 icmp in carry ops:\n{dis}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Lw;
+    use crate::gpu::dxil::{kernel, validate};
+    use crate::gpu::rdna2;
+
+    /// Direct Rust port of [`Lw::f32_to_f16_rm`] with `rm = 0` (RNE).
+    fn ref_f32_to_f16_rm0(x: u32) -> u32 {
+        let sign = (x >> 16) & 0x8000;
+        let ax = x & 0x7FFF_FFFF;
+        let isinfnan = ax >= 0x7F80_0000;
+        let isinf = ax == 0x7F80_0000;
+        let nanv = ((ax >> 13) & 0x1FF) | 0x7E00;
+        let infnan = sign | if isinf { 0x7C00 } else { nanv };
+        let zero = ax == 0;
+        let ovf = ax >= 0x4780_0000;
+        let ovfv = sign | 0x7C00;
+        let tiny = ax < 0x3380_0000;
+        let tinyv = sign | ((ax > 0x3300_0000) as u32);
+        let normal = ax >= 0x3880_0000;
+        let hn = ((ax >> 23).wrapping_sub(112).wrapping_shl(10)) | ((ax >> 13) & 0x3FF);
+        let remn = ax & 0x1FFF;
+        let sh = 126u32.wrapping_sub(ax >> 23) & 31;
+        let sig = (ax & 0x7F_FFFF) | 0x80_0000;
+        let hs = sig >> sh;
+        let halfs = 1u32 << (sh.wrapping_sub(1) & 31);
+        let rems = sig & ((1u32 << sh).wrapping_sub(1));
+        let (h, rem, hb) = if normal { (hn, remn, 0x1000) } else { (hs, rems, halfs) };
+        let inc = (rem > hb || (rem == hb && (h & 1) != 0)) as u32;
+        let r = sign | h.wrapping_add(inc);
+        let r = if tiny { tinyv } else { r };
+        let r = if ovf { ovfv } else { r };
+        let r = if zero { sign } else { r };
+        if isinfnan { infnan } else { r }
+    }
+
+    #[test]
+    fn f32_to_f16_rne_matches_rm0_bit_exact() {
+        let check_pair = |x: u32| {
+            let want = ref_f32_to_f16_rm0(x);
+            assert_eq!(Lw::f32_to_f16_rne_bits(x), want, "x={x:#010x}");
+            let nx = x | 0x8000_0000;
+            assert_eq!(Lw::f32_to_f16_rne_bits(nx), ref_f32_to_f16_rm0(nx), "nx={nx:#010x}");
+        };
+        // Explicit spot checks: ±0, FTZ denormals, subnormal boundaries/rollover, ties, overflow, ±Inf, sNaN/qNaN.
+        for (bits, want) in [
+            (0x0000_0000, 0x0000), (0x8000_0000, 0x8000), (0x0000_0001, 0x0000), (0x007F_FFFF, 0x0000),
+            (0x3300_0000, 0x0000), (0x3300_0001, 0x0001), (0x387F_DFFF, 0x03FF), (0x387F_E000, 0x0400),
+            (0x3880_0000, 0x0400), (3075.0f32.to_bits() - 1, 0x6A01), (3075.0f32.to_bits(), 0x6A02),
+            ((-3075.0f32).to_bits(), 0xEA02), (0x477F_EFFF, 0x7BFF), (0x477F_F000, 0x7C00),
+            (0x4780_0000, 0x7C00), (0x7F80_0000, 0x7C00), (0xFF80_0000, 0xFC00), (0x7F80_0001, 0x7E00),
+            (0xFF80_0001, 0xFE00), (0x7F80_2000, 0x7E01), (0x7FBF_FFFF, 0x7FFF), (0x7FC0_0000, 0x7E00),
+            (0xFFFF_FFFF, 0xFFFF),
+        ] {
+            assert_eq!(Lw::f32_to_f16_rne_bits(bits), want, "spot {bits:#010x}");
+            assert_eq!(ref_f32_to_f16_rm0(bits), want, "ref spot {bits:#010x}");
+        }
+        // Under D3D12 FTZ, f32 denormals flush to +0.0 before `fadd(..., 0.5f)` → 0x3F00_0000 - 0x3F00_0000 = 0.
+        assert_eq!((0.0f32 + 0.5f32).to_bits().wrapping_sub(0x3F00_0000), 0);
+        // Every bit pattern across the entire subnormal + rollover band (0x32FF_0000..=0x3881_0000) & negative mirror.
+        for x in 0x32FF_0000u32..=0x3881_0000 {
+            let want = ref_f32_to_f16_rm0(x);
+            assert_eq!(Lw::f32_to_f16_rne_bits(x), want, "sub x={x:#010x}");
+            assert_eq!(Lw::f32_to_f16_rne_bits(x | 0x8000_0000), want | 0x8000, "sub -x={x:#010x}");
+        }
+        // Remaining critical bands: ±0, f32 denormals, normal ties, 65504..65536, overflow, ±Inf, sNaN/qNaN extremes.
+        for range in [
+            0x0000_0000..=0x0000_0100, 0x007F_FF00..=0x0080_0100,
+            0x3F7F_E000..=0x3F80_2000, 0x4540_0000..=0x4541_0000,
+            0x477E_0000..=0x4781_0000, 0x7F7F_E000..=0x7F80_2000,
+            0x7FBF_E000..=0x7FC0_2000, 0x7FFF_F000..=0x7FFF_FFFF,
+        ] {
+            for x in range {
+                check_pair(x);
+            }
+        }
+        // Dense prime-strided sweep across the entire u32 space (positive + negative mirror).
+        let mut x = 0u32;
+        loop {
+            check_pair(x);
+            match x.checked_add(997) {
+                Some(next) if next <= 0x7FFF_FFFF => x = next,
+                _ => break,
+            }
+        }
+    }
+
+    #[test]
+    fn f32_to_f16_rne_dxil_valid_and_compact() {
+        const V: u64 = 256;
+        let opts = kernel::KernelOptions { wave64: false, split: false, mem_windows: 1, sampler_base: 0 };
+        let build = |list: &[(&str, &str, &[(&str, u64)])]| -> String {
+            let mut code = Vec::new();
+            for &(name, enc, fields) in list {
+                code.extend(rdna2::encode(name, enc, fields, None).unwrap_or_else(|e| panic!("encode {name}: {e}")));
+            }
+            code.extend(rdna2::encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+            let dxil = kernel::translate(&code, opts).expect("direct translate");
+            validate::validate(&dxil).expect("dxil validate");
+            validate::disassemble(&dxil).expect("dxil disassemble")
+        };
+        let main_insts = |dis: &str| {
+            let body = dis.split("define void @main()").nth(1).unwrap_or(dis).split("\n}\n").next().unwrap_or(dis);
+            body.lines().filter(|l| l.starts_with("  ") && !l.trim_start().starts_with(';')).count()
+        };
+
+        let mov_dis = build(&[("V_MOV_B32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)])]);
+        let cvt_dis = build(&[("V_CVT_F16_F32", "ENC_VOP1", &[("VDST", 1), ("SRC0", V)])]);
+        assert!(!cvt_dis.contains("legacyF32ToF16"), "v_cvt_f16_f32 must not use legacyF32ToF16:\n{cvt_dis}");
+        assert!(cvt_dis.contains("fadd float "), "v_cvt_f16_f32 must emit unflagged fadd float:\n{cvt_dis}");
+        assert!(!cvt_dis.contains("fadd fast") && !cvt_dis.contains("fadd nsz"), "fadd must carry no FMF:\n{cvt_dis}");
+        let cvt_delta = main_insts(&cvt_dis).saturating_sub(main_insts(&mov_dis));
+        assert!(cvt_delta > 0 && cvt_delta <= 28, "expected <= 28 non-preamble IR insts for v_cvt_f16_f32, got {cvt_delta}:\n{cvt_dis}");
+
+        let add_dis = build(&[("V_ADD_NC_U32", "ENC_VOP2", &[("VDST", 3), ("SRC0", V + 1), ("VSRC1", 2)])]);
+        let pk_dis = build(&[("V_PK_MUL_F16", "ENC_VOP3P", &[("VDST", 3), ("SRC0", V + 1), ("SRC1", V + 2), ("OP_SEL_HI", 3)])]);
+        assert!(!pk_dis.contains("legacyF32ToF16"), "v_pk_mul_f16 must not use legacyF32ToF16:\n{pk_dis}");
+        assert!(pk_dis.contains("fadd float "), "v_pk_mul_f16 must emit unflagged fadd float:\n{pk_dis}");
+        let pk_delta = main_insts(&pk_dis).saturating_sub(main_insts(&add_dis));
+        assert!(pk_delta > 0 && pk_delta <= 64, "expected <= 64 non-preamble IR insts for v_pk_mul_f16, got {pk_delta}:\n{pk_dis}");
     }
 }

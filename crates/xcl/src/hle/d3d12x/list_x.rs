@@ -810,6 +810,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::alloc_pool::forget_list(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -827,6 +828,11 @@ pub(super) fn clear_segment_state(list: usize) {
 #[cfg(test)]
 pub(super) fn has_list_state(list: usize) -> bool {
     LISTS.lock().unwrap().as_ref().is_some_and(|m| m.contains_key(&list))
+}
+
+#[cfg(test)]
+pub(super) fn is_live_queue(queue: usize) -> bool {
+    LIVE_QUEUES.lock().unwrap().iter().any(|q| q.queue == queue)
 }
 
 /// Forget a released command allocator so `KickoffX` will not reset a list with a dead allocator.
@@ -2561,18 +2567,26 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         if reset_hr >= 0 {
             reset_copy_scratch(spare);
             next_pc = Some(spare);
+        } else {
+            super::title_list::release_failed_spare(spare);
         }
     }
     let next_pc = match next_pc {
         Some(p) => p,
-        None => match real::create_raw_pc_command_list(dev.as_raw(), ty, super::alloc_pool::current(alloc), init_pso) {
-            Some(p) => p,
-            None => {
-                static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
-                warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
-                return None;
+        None => {
+            let backing = super::alloc_pool::current(alloc);
+            match real::create_raw_pc_command_list(dev.as_raw(), ty, backing, init_pso) {
+                Some(p) => {
+                    super::alloc_pool::created_on_backing(p as usize, alloc, backing, ty.0);
+                    p
+                }
+                None => {
+                    static CREATE_ERR: AtomicU64 = AtomicU64::new(0);
+                    warn(&CREATE_ERR, "Wait64 mid-list split", format_args!("CreateCommandList failed"));
+                    return None;
+                }
             }
-        },
+        }
     };
 
     let old_next = {
@@ -2616,7 +2630,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
-    super::bind::inherit_for_split(list, next_pc, alloc);
+    super::bind::inherit_for_split(list, next_pc, super::alloc_pool::backing_of(next_pc as usize, super::alloc_pool::current(alloc)));
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -3070,7 +3084,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 (Vec::new(), None, Bindings::default())
             }
         };
-        super::bind::inherit_for_split(this, primary, alloc);
+        super::bind::inherit_for_split(this, primary, super::alloc_pool::backing_of(primary as usize, alloc));
         for seg in reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
@@ -3707,7 +3721,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
+    super::bind::reset(this, super::alloc_pool::backing_of(this as usize, alloc), pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {

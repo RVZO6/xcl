@@ -303,34 +303,80 @@ struct ListState {
     arena: crate::gpu::uma::Arena,
 }
 
+#[derive(Default)]
+pub(super) struct Pending { by_alloc: HashMap<usize, Vec<usize>>, unknown_cur: Vec<usize>, unknown_prev: Vec<usize> }
+pub(super) struct Retired(Vec<(ID3D12Fence, u64)>, Vec<usize>);
+unsafe impl Send for Retired {}
+
 static LISTS: Mutex<Option<HashMap<usize, ListState>>> = Mutex::new(None);
 /// unified-memory blocks of finished recordings, freed when their allocator is reset
-static PENDING: Mutex<Option<HashMap<usize, Vec<usize>>>> = Mutex::new(None);
+static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+static RETIRED: Mutex<Vec<Retired>> = Mutex::new(Vec::new());
 
 /// Unified-memory blocks a recording on `allocator` uses: freed when it is reset (no
 /// allocator known: kept until the next reset of any – never freed early).
 pub(super) fn hold_until_reset(allocator: usize, blocks: Vec<usize>) {
-    if !blocks.is_empty() {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(allocator).or_default().extend(blocks);
-    }
+    unsafe { hold_in(&PENDING, &RETIRED, allocator, blocks, |b| free_uma(b)) };
 }
 
 /// Unified-memory blocks recordings hold until their allocators reset: (allocators, blocks).
 pub fn pending_blocks() -> (usize, usize) {
-    PENDING.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.len()).sum()))
+    counts_in(&PENDING, &RETIRED)
 }
 
 #[cfg(test)]
 pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
-    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.by_alloc.remove(&allocator)).unwrap_or_default()
 }
 
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
-    let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
-    if let Some(b) = blocks {
-        unsafe { free_uma(&b) };
+    unsafe { reset_in(&PENDING, &RETIRED, allocator as usize, |b| free_uma(b)) };
+}
+
+pub(super) unsafe fn retire_backings(free: &[usize], busy: Vec<(usize, Vec<(ID3D12Fence, u64)>)>) {
+    if let Some(m) = LISTS.lock().unwrap().as_mut() {
+        for st in m.values_mut() { if st.allocator != 0 && (free.contains(&st.allocator) || busy.iter().any(|(b, _)| *b == st.allocator)) { st.allocator = 0; } }
     }
+    retire_in(&PENDING, &RETIRED, free, busy, |b| free_uma(b));
+}
+
+unsafe fn drain_and_free(r_mtx: &Mutex<Vec<Retired>>, defer: Vec<Retired>, mut to_free: Vec<usize>, mut done: Vec<Vec<(ID3D12Fence, u64)>>, mut free_fn: impl FnMut(&[usize])) {
+    let mut r = r_mtx.lock().unwrap();
+    r.extend(defer);
+    let mut i = 0;
+    while i < r.len() {
+        if r[i].0.iter().all(|(f, v)| f.GetCompletedValue() >= *v) { let Retired(m, b) = r.swap_remove(i); to_free.extend(b); done.push(m); } else { i += 1; }
+    }
+    drop(r); drop(done);
+    if !to_free.is_empty() { free_fn(&to_free); }
+}
+pub(super) unsafe fn hold_in(p: &Mutex<Option<Pending>>, r: &Mutex<Vec<Retired>>, alloc: usize, blocks: Vec<usize>, free_fn: impl FnMut(&[usize])) {
+    if !blocks.is_empty() {
+        let mut g = p.lock().unwrap(); let st = g.get_or_insert_with(Pending::default);
+        if alloc == 0 { st.unknown_cur.extend(blocks); } else { st.by_alloc.entry(alloc).or_default().extend(blocks); }
+    }
+    drain_and_free(r, Vec::new(), Vec::new(), Vec::new(), free_fn);
+}
+pub(super) unsafe fn reset_in(p: &Mutex<Option<Pending>>, r: &Mutex<Vec<Retired>>, alloc: usize, free_fn: impl FnMut(&[usize])) {
+    let blocks = p.lock().unwrap().as_mut().map_or_else(Vec::new, |st| {
+        let mut out = if alloc != 0 { st.by_alloc.remove(&alloc).unwrap_or_default() } else { Vec::new() };
+        out.extend(std::mem::replace(&mut st.unknown_prev, std::mem::take(&mut st.unknown_cur)));
+        out
+    });
+    drain_and_free(r, Vec::new(), blocks, Vec::new(), free_fn);
+}
+pub(super) unsafe fn retire_in(p: &Mutex<Option<Pending>>, r: &Mutex<Vec<Retired>>, free: &[usize], busy: Vec<(usize, Vec<(ID3D12Fence, u64)>)>, free_fn: impl FnMut(&[usize])) {
+    let (mut to_free, mut defer, mut done) = (Vec::new(), Vec::new(), Vec::new());
+    if let Some(st) = p.lock().unwrap().as_mut() {
+        for &b in free { if let Some(v) = st.by_alloc.remove(&b) { to_free.extend(v); } }
+        for (b, m) in busy { match st.by_alloc.remove(&b) { Some(v) if !v.is_empty() => defer.push(Retired(m, v)), _ => done.push(m) } }
+    } else { done.extend(busy.into_iter().map(|(_, m)| m)); }
+    drain_and_free(r, defer, to_free, done, free_fn);
+}
+pub(super) fn counts_in(p: &Mutex<Option<Pending>>, r: &Mutex<Vec<Retired>>) -> (usize, usize) {
+    let (a, b) = p.lock().unwrap().as_ref().map_or((0, 0), |st| (st.by_alloc.len() + usize::from(!st.unknown_cur.is_empty() || !st.unknown_prev.is_empty()), st.by_alloc.values().map(Vec::len).sum::<usize>() + st.unknown_cur.len() + st.unknown_prev.len()));
+    (a, b + r.lock().unwrap().iter().map(|e| e.1.len()).sum::<usize>())
 }
 
 fn with_list<R>(obj: usize, f: impl FnOnce(&mut ListState) -> R) -> Option<R> {
@@ -389,8 +435,8 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     })
     .unwrap_or(0);
     if left == 0 {
-        if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
-            free_uma(&st.uma);
+        if let Some(st) = { LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) } {
+            hold_until_reset(st.allocator, st.uma);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             release(st.pc);
         }
@@ -430,9 +476,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
         return crate::util::E_FAIL;
     };
     // what the previous recording left in unified memory lives until its allocator resets
-    if !blocks.is_empty() {
-        PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
-    }
+    hold_until_reset(old_alloc, blocks);
     with_list(obj, |st| new_chunk(obj, st));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
     f(pc, allocator, pc_pso(pso))
@@ -1015,5 +1059,20 @@ mod tests {
         let l = layout_from_blob(&rts0(&[(1, 2), (2, 0), (0, 0)])).unwrap();
         let args: Vec<u8> = [1u32, 2, 0x5000, 4, 0x80].iter().flat_map(|w| w.to_le_bytes()).collect();
         assert_eq!(user_data_gfx(&l, &args, 0x200), vec![0x200, 0, 0, 0, 0, 0, 0, 0, 1, 2, 0x5000, 4, 0x80]);
+    }
+
+    #[test]
+    fn unknown_allocator_blocks_do_not_leak_permanently() {
+        let (p, r, mut freed) = (Mutex::new(None), Mutex::new(Vec::new()), Vec::new());
+        unsafe {
+            hold_in(&p, &r, 0, vec![0x101, 0x102], |b| freed.extend_from_slice(b));
+            reset_in(&p, &r, 0x5000, |b| freed.extend_from_slice(b));
+            assert!(freed.is_empty() && counts_in(&p, &r) == (1, 2), "first reset rotates without freeing early");
+            hold_in(&p, &r, 0, vec![0x201], |b| freed.extend_from_slice(b));
+            reset_in(&p, &r, 0x6000, |b| freed.extend_from_slice(b));
+            assert_eq!((&freed[..], counts_in(&p, &r)), (&[0x101, 0x102][..], (1, 1)));
+            reset_in(&p, &r, 0x7000, |b| freed.extend_from_slice(b));
+            assert_eq!((&freed[..], counts_in(&p, &r)), (&[0x101, 0x102, 0x201][..], (0, 0)));
+        }
     }
 }
