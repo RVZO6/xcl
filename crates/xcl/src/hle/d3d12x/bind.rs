@@ -128,6 +128,14 @@ pub(super) fn forget(list: *mut c_void) {
     }
 }
 
+/// Clear released backing keys from live lists so later resets route UMA blocks to `0`.
+pub(super) fn on_allocator_release(backings: &[usize]) {
+    if backings.is_empty() { return; }
+    if let Some(m) = STATES.lock().unwrap().as_mut() {
+        for s in m.values_mut() { if s.allocator != 0 && backings.contains(&s.allocator) { s.allocator = 0; } }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso: usize, uma: Vec<usize>) {
     with(list, |s| {

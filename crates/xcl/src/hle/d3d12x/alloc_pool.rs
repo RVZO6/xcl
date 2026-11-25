@@ -114,6 +114,12 @@ pub fn current(alloc: usize) -> usize {
     STATE.lock().unwrap().as_ref().and_then(|s| s.cur.get(&alloc).copied()).unwrap_or(alloc)
 }
 
+/// The PC allocator `list`'s current recording lives on (`fallback_alloc` when untracked).
+pub fn backing_of(list: usize, fallback_alloc: usize) -> usize {
+    if !enabled() { return fallback_alloc; }
+    STATE.lock().unwrap().as_ref().and_then(|s| s.of_list.get(&list).copied()).unwrap_or(fallback_alloc)
+}
+
 /// `list` (of type `ty`) was made recording on the PC allocator `raw` itself
 /// (CreateCommandList).
 pub fn created_on(list: usize, raw: usize, ty: i32) {
@@ -158,90 +164,107 @@ pub unsafe fn executed(queue: *mut c_void, lists: &[*mut c_void]) {
     }
 }
 
+#[derive(Default)]
+pub(super) struct ForgottenBackings { pub free: Vec<usize>, pub busy: Vec<(usize, Vec<(ID3D12Fence, u64)>)> }
+
 /// The title's allocator `alloc` is gone (its last Release): nothing of it stays here – a later
 /// allocator may get its address, and must not go on with this one's PC allocators. The ones
 /// made here go with it (those lists still record on are left alone: not freed, not tracked).
-pub unsafe fn forget(alloc: usize) {
-    let made: Vec<usize> = {
+pub(super) unsafe fn forget(alloc: usize) -> ForgottenBackings {
+    if alloc == 0 { return ForgottenBackings::default(); }
+    let (made, out) = {
         let mut g = STATE.lock().unwrap();
-        let Some(s) = g.as_mut() else { return };
+        let Some(s) = g.as_mut() else { return ForgottenBackings { free: vec![alloc], busy: Vec::new() }; };
         s.types.remove(&alloc);
         let mut mine: Vec<usize> = s.aside.remove(&alloc).unwrap_or_default();
         mine.extend(s.cur.remove(&alloc));
         mine.push(alloc);
-        let mut made = Vec::new();
+        let (mut seen, mut made, mut out) = (HashSet::new(), Vec::new(), ForgottenBackings::default());
         for b in mine {
+            if !seen.insert(b) { continue; }
             let free = s.backings.get(&b).is_none_or(|x| x.free());
             if let Some(gone) = s.backings.remove(&b) {
                 for l in gone.users {
                     s.of_list.remove(&l);
                 }
-            }
+                if free { out.free.push(b); } else { out.busy.push((b, gone.marks.into_values().collect())); }
+            } else { out.free.push(b); }
             if b != alloc && free {
                 made.push(b);
             }
         }
-        made
+        (made, out)
     };
     // (outside the lock: their Release comes back here)
     for b in made {
         drop(ID3D12CommandAllocator::from_raw(b as *mut c_void));
     }
+    out
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ResetResult { pub hr: Option<HRESULT>, pub reset_backing: Option<usize> }
 
 /// The title resets its allocator `alloc`. `None`: reset it as it is (nothing holds a
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
-pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+pub(super) unsafe fn title_reset_with_backing(alloc: *mut c_void) -> ResetResult {
     if !enabled() {
-        return None;
+        return ResetResult { hr: None, reset_backing: Some(alloc as usize) };
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
-    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw))
+    title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw), None)
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
-unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT) -> Option<HRESULT> {
+unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMut(*mut c_void) -> HRESULT, create: Option<&mut dyn FnMut(i32) -> Option<usize>>) -> ResetResult {
     let a = alloc as usize;
     let c = s.cur.get(&a).copied().unwrap_or(a);
+    let fallback = ResetResult { hr: None, reset_backing: Some(a) };
     if s.backings.get(&c).is_none_or(|b| b.free()) {
         if let Some(b) = s.backings.get_mut(&c) {
             b.marks.clear();
         }
         if c == a {
-            return None;
+            return fallback;
         }
-        return Some(reset(c as *mut c_void));
+        let hr = reset(c as *mut c_void);
+        return ResetResult { hr: Some(hr), reset_backing: (hr >= 0).then_some(c) };
     }
-    let ty = *s.types.get(&a)?;
+    let Some(&ty) = s.types.get(&a) else { return fallback };
     // one put aside earlier that nothing uses any more, or a new one
     let reuse = s.aside.get(&a).and_then(|v| v.iter().copied().find(|f| s.backings.get(f).is_none_or(|b| b.free())));
-    let next = match reuse {
+    let (next, hr, reset_backing) = match reuse {
         Some(f) => {
             // Keep ownership until Reset succeeds so a failure can be retried.
             let hr = reset(f as *mut c_void);
             if hr < 0 {
-                return Some(hr);
+                return ResetResult { hr: Some(hr), reset_backing: None };
             }
             s.aside.get_mut(&a).unwrap().retain(|&x| x != f);
             if let Some(b) = s.backings.get_mut(&f) {
                 b.marks.clear();
             }
-            f
+            (f, hr, Some(f))
         }
-        None => {
-            let this = ID3D12CommandAllocator::from_raw_borrowed(&alloc)?;
+        None => 'make: {
+            if let Some(f) = create {
+                let Some(raw) = f(ty) else { return fallback };
+                s.made += 1;
+                break 'make (raw, 0, None);
+            }
+            let Some(this) = ID3D12CommandAllocator::from_raw_borrowed(&alloc) else { return fallback };
             let mut dev: Option<ID3D12Device> = None;
-            this.GetDevice(&mut dev).ok()?;
-            let made: ID3D12CommandAllocator = dev?.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE(ty)).ok()?;
+            if this.GetDevice(&mut dev).is_err() { return fallback; }
+            let Some(Ok(made)) = dev.map(|d| d.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE(ty))) else { return fallback };
             let raw = made.into_raw();
             // (made through the title's device it is adopted already)
             if !super::real::is_adopted(raw) {
                 super::real::adopt(raw, super::real::Kind::CommandAllocator);
             }
             s.made += 1;
-            raw as usize
+            (raw as usize, 0, None)
         }
     };
     s.aside.entry(a).or_default().push(c);
@@ -255,7 +278,7 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
             s.made
         );
     }
-    Some(0)
+    ResetResult { hr: Some(hr), reset_backing }
 }
 
 #[cfg(test)]
@@ -277,9 +300,9 @@ mod tests {
                 title_reset_in(&mut s, alloc as *mut c_void, |raw| {
                     calls.push(raw as usize);
                     crate::util::E_FAIL
-                })
+                }, None)
             };
-            assert_eq!(hr, Some(crate::util::E_FAIL));
+            assert_eq!(hr, ResetResult { hr: Some(crate::util::E_FAIL), reset_backing: None });
             assert_eq!(s.aside.get(&alloc), Some(&vec![spare]), "the failed candidate is still owned and reusable");
             assert!(!s.cur.contains_key(&alloc), "the current backing did not change");
             assert_eq!(s.of_list.get(&list), Some(&alloc));
@@ -291,9 +314,9 @@ mod tests {
             title_reset_in(&mut s, alloc as *mut c_void, |raw| {
                 calls.push(raw as usize);
                 0
-            })
+            }, None)
         };
-        assert_eq!(hr, Some(0));
+        assert_eq!(hr, ResetResult { hr: Some(0), reset_backing: Some(spare) });
         assert_eq!(calls, vec![spare; 3], "all attempts used the same spare without creating another");
         assert_eq!(s.cur.get(&alloc), Some(&spare));
         assert_eq!(s.aside.get(&alloc), Some(&vec![alloc]), "only the successful reset switches backings");
@@ -442,6 +465,70 @@ mod tests {
             drop(alloc);
             assert_eq!(current(a as usize), a as usize, "a released allocator leaves nothing behind");
             assert!(!STATE.lock().unwrap().as_ref().unwrap().types.contains_key(&(a as usize)));
+        }
+    }
+
+    #[test]
+    fn alloc_pool_swap_keeps_aside_backing_uma_blocks_pinned_until_that_backing_resets() {
+        use super::super::console_list::{hold_in, reset_in};
+        let (a, b, l1, l2) = (0x8100_1000usize, 0x8100_2000usize, 0x8100_3000usize, 0x8100_4000usize);
+        let (mut s, p, r, mut freed) = (State::default(), Mutex::new(None), Mutex::new(Vec::new()), Vec::new());
+        (s.types.insert(a, D3D12_COMMAND_LIST_TYPE_DIRECT.0), move_list(&mut s, l1, a));
+        unsafe {
+            hold_in(&p, &r, a, vec![0xA001], |x| freed.extend_from_slice(x));
+            assert_eq!(title_reset_in(&mut s, a as *mut c_void, |_| 0, Some(&mut |_| Some(b))), ResetResult { hr: Some(0), reset_backing: None });
+            (move_list(&mut s, l2, b), move_list(&mut s, l1, b), hold_in(&p, &r, b, vec![0xB001], |x| freed.extend_from_slice(x)));
+            assert!(freed.is_empty());
+            let r2 = title_reset_in(&mut s, a as *mut c_void, |_| 0, None);
+            assert_eq!(r2, ResetResult { hr: Some(0), reset_backing: Some(a) });
+            reset_in(&p, &r, r2.reset_backing.unwrap(), |x| freed.extend_from_slice(x));
+            assert_eq!(freed, vec![0xA001], "aside backing `b` stays pinned while reused `a` frees");
+            (move_list(&mut s, l1, a), move_list(&mut s, l2, a));
+            let r3 = title_reset_in(&mut s, a as *mut c_void, |_| 0, None);
+            assert_eq!(r3, ResetResult { hr: Some(0), reset_backing: Some(b) });
+            reset_in(&p, &r, r3.reset_backing.unwrap(), |x| freed.extend_from_slice(x));
+            s.backings.get_mut(&a).unwrap().users.clear();
+            assert_eq!((&freed[..], title_reset_in(&mut s, a as *mut c_void, |_| crate::util::E_FAIL, None), title_reset_in(&mut s, a as *mut c_void, |_| 0, None)), (&[0xA001, 0xB001][..], ResetResult { hr: Some(crate::util::E_FAIL), reset_backing: None }, ResetResult { hr: Some(0), reset_backing: Some(b) }));
+        }
+    }
+
+    #[test]
+    fn alloc_release_reclaims_free_backings_and_defers_busy_backings_until_fence_completes() {
+        use super::super::console_list::{counts_in, hold_in, retire_in};
+        use std::cell::Cell;
+        use std::mem::{offset_of, size_of};
+        #[repr(C)]
+        struct Fake { vt: *const usize, val: Cell<u64>, rel: Cell<u32> }
+        unsafe extern "system" fn done(t: *mut c_void) -> u64 { (*t.cast::<Fake>()).val.get() }
+        unsafe extern "system" fn rel(t: *mut c_void) -> u32 { let f = &*t.cast::<Fake>(); f.rel.set(f.rel.get() + 1); 0 }
+        extern "system" fn bad() { std::process::abort(); }
+        const S: usize = size_of::<usize>();
+        let mut fvt = [bad as usize; size_of::<ID3D12Fence_Vtbl>() / S];
+        (fvt[offset_of!(ID3D12Fence_Vtbl, GetCompletedValue) / S], fvt[offset_of!(ID3D12Fence_Vtbl, base__.base__.base__.base__.Release) / S]) = (done as usize, rel as usize);
+        let avt = [bad as usize, bad as usize, rel as usize];
+        let mk = |vt: *const usize| Fake { vt, val: Cell::new(0), rel: Cell::new(0) };
+        let (mut fence, mut free_obj, mut busy_obj) = (mk(fvt.as_ptr()), mk(avt.as_ptr()), mk(avt.as_ptr()));
+        let mut ids = Box::new([0u8; 2]);
+        let (alloc, list, free_b, busy_b) = (ids.as_mut_ptr() as usize, ids.as_mut_ptr() as usize + 1, std::ptr::from_mut(&mut free_obj) as usize, std::ptr::from_mut(&mut busy_obj) as usize);
+        let (p, r, mut freed) = (Mutex::new(None), Mutex::new(Vec::new()), Vec::new());
+        {
+            let mut g = STATE.lock().unwrap(); let s = g.get_or_insert_with(State::default);
+            (s.cur.insert(alloc, busy_b), s.aside.insert(alloc, vec![free_b, alloc]), s.backings.insert(free_b, Backing::default()));
+            s.backings.entry(busy_b).or_default().marks.insert(1, (unsafe { ID3D12Fence::from_raw(std::ptr::from_mut(&mut fence).cast()) }, 7));
+        }
+        super::super::bind::seed_reset_state_for_test(list as *mut c_void, busy_b, 0, Vec::new());
+        unsafe {
+            for (k, v) in [(alloc, vec![0xA1]), (free_b, vec![0xF1]), (busy_b, vec![0xB1, 0xB2])] { hold_in(&p, &r, k, v, |x| freed.extend_from_slice(x)); }
+            let gone = forget(alloc);
+            let all: Vec<usize> = gone.free.iter().copied().chain(gone.busy.iter().map(|(b, _)| *b)).collect();
+            super::super::bind::on_allocator_release(&all);
+            let cleared = super::super::bind::reset_state_for_test(list as *mut c_void).0; super::super::bind::remove_state_for_test(list as *mut c_void);
+            (retire_in(&p, &r, &gone.free, gone.busy, |x| freed.extend_from_slice(x)), freed.sort_unstable());
+            assert_eq!((cleared, free_obj.rel.get(), busy_obj.rel.get(), &freed[..]), (0, 1, 0, &[0xA1, 0xF1][..]));
+            (fence.val.set(6), hold_in(&p, &r, 0x9999, Vec::new(), |x| freed.extend_from_slice(x)));
+            assert_eq!((freed.len(), fence.rel.get()), (2, 0));
+            (fence.val.set(7), hold_in(&p, &r, 0x9999, Vec::new(), |x| freed.extend_from_slice(x)), freed.sort_unstable());
+            assert_eq!((&freed[..], fence.rel.get(), counts_in(&p, &r)), (&[0xA1, 0xB1, 0xB2, 0xF1][..], 1, (0, 0)));
         }
     }
 }

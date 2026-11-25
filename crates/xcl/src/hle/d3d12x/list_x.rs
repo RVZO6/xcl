@@ -2621,7 +2621,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     };
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
-    super::bind::inherit_for_split(list, next_pc, alloc);
+    super::bind::inherit_for_split(list, next_pc, super::alloc_pool::backing_of(next_pc as usize, super::alloc_pool::current(alloc)));
     restore_bindings(next_pc, &bindings, ty);
 
     if ty == D3D12_COMMAND_LIST_TYPE_DIRECT {
@@ -3075,7 +3075,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
                 (Vec::new(), None, Bindings::default())
             }
         };
-        super::bind::inherit_for_split(this, primary, alloc);
+        super::bind::inherit_for_split(this, primary, super::alloc_pool::backing_of(primary as usize, alloc));
         for seg in reclaimed {
             super::bind::reset(seg as *mut c_void, 0, 0);
             clear_segment_state(seg);
@@ -3712,7 +3712,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         s.list_type == Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
     };
     super::title_textures::list_reset(this as usize);
-    super::bind::reset(this, alloc, pso);
+    super::bind::reset(this, super::alloc_pool::backing_of(this as usize, alloc), pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
             if !static_bias.is_zero() && try_native_depth_bias(this, static_bias) {
