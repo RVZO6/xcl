@@ -124,3 +124,138 @@ fn a_mask_read_whole_after_one_copy_only_splits_the_class() {
     assert_eq!(p.order.len(), 4);
     assert_ne!(p.class[0], p.class[2]);
 }
+
+fn distinct_classes(classes: usize, with_loop: bool) -> Vec<u8> {
+    let jump_blocks = classes - if with_loop { 2 } else { 1 };
+    let mut v = Vec::new();
+    for k in 0..jump_blocks {
+        v.extend(encode("S_ADD_U32", "ENC_SOP2", &[("SDST", 0), ("SSRC0", 0), ("SSRC1", 255)], Some(k as u32 + 1)).unwrap());
+        v.extend(encode("S_BRANCH", "ENC_SOPP", &[("SIMM16", 0)], None).unwrap());
+    }
+    if with_loop {
+        v.extend(encode("S_SUB_U32", "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 129)], None).unwrap());
+        v.extend(encode("S_CMP_LG_U32", "ENC_SOPC", &[("SSRC0", 4), ("SSRC1", 128)], None).unwrap());
+        v.extend(encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFD)], None).unwrap());
+    }
+    v.extend(encode("S_ENDPGM", "ENC_SOPP", &[], None).unwrap());
+    v
+}
+
+struct DisasmCfg {
+    switches: usize,
+    max_switch_targets: usize,
+    max_fan_in: usize,
+    latch_fan_in: Option<usize>,
+}
+
+fn disasm_cfg(dis: &str, block_count: usize) -> DisasmCfg {
+    let mut in_fn = false;
+    let mut cur_label: Option<String> = None;
+    let mut latch_label: Option<String> = None;
+    let mut switches = 0usize;
+    let mut in_switch = false;
+    let mut switch_targets = 0usize;
+    let mut max_switch_targets = 0usize;
+    let mut in_degree: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let latch_suffix = format!(", {block_count}");
+    for line in dis.lines() {
+        let t = line.trim();
+        if t.starts_with("define ") {
+            in_fn = true;
+            cur_label = None;
+            continue;
+        }
+        if !in_fn {
+            continue;
+        }
+        if t == "}" {
+            break;
+        }
+        if let Some(rest) = t.strip_prefix("; <label>:") {
+            cur_label = rest.trim_start().split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.').next().filter(|s| !s.is_empty()).map(str::to_string);
+            continue;
+        }
+        let code = t.split(';').next().unwrap_or("").trim();
+        if code.is_empty() {
+            continue;
+        }
+        if cur_label.is_some() && code.contains("icmp uge i32 ") && code.ends_with(&latch_suffix) {
+            latch_label = cur_label.clone();
+        }
+        if code.starts_with("switch i32 ") {
+            switches += 1;
+            in_switch = true;
+            switch_targets = 0;
+        }
+        let mut rest = code;
+        while let Some(pos) = rest.find("label %") {
+            rest = &rest[pos + "label %".len()..];
+            let end = rest.find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '.').unwrap_or(rest.len());
+            let target = &rest[..end];
+            if !target.is_empty() {
+                *in_degree.entry(target.to_string()).or_insert(0) += 1;
+                if in_switch {
+                    switch_targets += 1;
+                }
+            }
+            rest = &rest[end..];
+        }
+        if in_switch && code.ends_with(']') {
+            max_switch_targets = max_switch_targets.max(switch_targets);
+            in_switch = false;
+        }
+    }
+    DisasmCfg {
+        switches,
+        max_switch_targets,
+        max_fan_in: in_degree.values().copied().max().unwrap_or(0),
+        latch_fan_in: latch_label.and_then(|l| in_degree.get(&l).copied()),
+    }
+}
+
+#[test]
+fn large_class_counts_use_nested_switch_dispatch_with_bounded_fan_in() {
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    for (classes, with_loop) in [(65, false), (65, true), (100, false)] {
+        let code = distinct_classes(classes, with_loop);
+        let cfg = super::cfg::Cfg::build(&code).unwrap();
+        let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+        let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+        let p = super::compact::plan(&cfg, &lw).unwrap();
+        assert_eq!(p.rep.len(), classes, "classes={classes} with_loop={with_loop}");
+        assert_eq!(!cfg.headers.is_empty(), with_loop);
+
+        let k = translate_full_as(&code, o, true).unwrap_or_else(|e| panic!("classes={classes} with_loop={with_loop}: {e}"));
+        super::validate::validate(&k.dxil).unwrap_or_else(|e| panic!("validate classes={classes} with_loop={with_loop}: {e}"));
+        let dis = super::validate::disassemble(&k.dxil).expect("disassemble");
+        let stats = disasm_cfg(&dis, p.order.len());
+        let groups = classes.div_ceil(32);
+        let expected_switches = 1 + classes / 32 + usize::from(classes % 32 > 1);
+        assert_eq!(stats.switches, expected_switches, "classes={classes} with_loop={with_loop}: expected outer + inner switches");
+        assert!(stats.max_switch_targets <= 32, "classes={classes}: switch targets {}", stats.max_switch_targets);
+        assert!(stats.max_fan_in <= 32, "classes={classes} with_loop={with_loop}: max fan-in {}", stats.max_fan_in);
+        let latch_fan_in = stats.latch_fan_in.expect("latch block in disassembly");
+        assert!(latch_fan_in <= groups + 2, "classes={classes}: latch fan-in {latch_fan_in} > {}", groups + 2);
+        assert_eq!(latch_fan_in, groups, "classes={classes} with_loop={with_loop}: exact latch fan-in");
+    }
+}
+
+#[test]
+fn small_class_counts_keep_single_flat_switch() {
+    let o = KernelOptions { wave64: true, split: true, mem_windows: 1, sampler_base: 0 };
+    for classes in [16, 32] {
+        let code = distinct_classes(classes, false);
+        let cfg = super::cfg::Cfg::build(&code).unwrap();
+        let leaders = cfg.blocks.iter().filter_map(|b| b.insts.first().map(|&i| cfg.insts[i].pc)).collect();
+        let lw = super::lower::Lw::new(&cfg.insts, &leaders, o, &super::kernel::Entry::Kernel);
+        let p = super::compact::plan(&cfg, &lw).unwrap();
+        assert_eq!(p.rep.len(), classes);
+
+        let k = translate_full_as(&code, o, true).unwrap_or_else(|e| panic!("classes={classes}: {e}"));
+        super::validate::validate(&k.dxil).unwrap_or_else(|e| panic!("validate classes={classes}: {e}"));
+        let dis = super::validate::disassemble(&k.dxil).expect("disassemble");
+        let stats = disasm_cfg(&dis, p.order.len());
+        assert_eq!(stats.switches, 1, "classes={classes}: expected single flat switch");
+        assert_eq!(stats.max_switch_targets, classes);
+    }
+}
