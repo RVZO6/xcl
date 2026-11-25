@@ -857,17 +857,20 @@ impl Lw {
                 }
             }
             "v_mad_u64_u32" | "v_mad_i64_i32" => {
-                let p = if name == "v_mad_u64_u32" {
-                    let (x, y) = (self.zext64(lh[0].0), self.zext64(lh[1].0));
-                    self.mul(x, y)
+                let (p_hi, p_lo) = if name == "v_mad_u64_u32" {
+                    self.s.umul_wide(lh[0].0, lh[1].0)
                 } else {
-                    let (x, y) = (self.sext64(lh[0].0), self.sext64(lh[1].0));
-                    self.mul(x, y)
+                    self.s.imul_wide(lh[0].0, lh[1].0)
                 };
-                let c = u64v(self, 2);
-                let w = self.add(p, c);
-                let (lo, hi) = self.unpack64(w);
-                let carry = self.cmp64("lt", false, (lo, hi), lh[2]).expect("lt");
+                let (c_lo, c_hi) = lh[2];
+                let lo = self.add(p_lo, c_lo);
+                let c0 = self.cmp(Pred::ULt, lo, c_lo);
+                let hi1 = self.add(p_hi, c_hi);
+                let c1 = self.cmp(Pred::ULt, hi1, c_hi);
+                let c0u = self.u(c0);
+                let hi = self.add(hi1, c0u);
+                let c2 = self.cmp(Pred::ULt, hi, hi1);
+                let carry = self.lor(c1, c2);
                 let sdst = outs.get(1).map(|o| Self::dst_of(d, o)).unwrap_or(Dst::Null);
                 self.write_mask(&sdst, carry);
                 self.write64(&dst, lo, hi);

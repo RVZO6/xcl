@@ -390,10 +390,13 @@ impl Shader {
         self.op(53, "quaternary", Some(t), t, &[width, offset, value, replaced], FnAttrs::ReadNone)
     }
 
-    fn two_outs(&mut self, op: u32, a: Value, b: Value) -> (Value, Value) {
+    fn two_outs_raw(&mut self, op: u32, a: Value, b: Value) -> Value {
         let i32 = self.m.i32();
         let st = self.m.named_struct("dx.types.twoi32", &[i32, i32]);
-        let r = self.op(op, "binaryWithTwoOuts", Some(i32), st, &[a, b], FnAttrs::ReadNone);
+        self.op(op, "binaryWithTwoOuts", Some(i32), st, &[a, b], FnAttrs::ReadNone)
+    }
+    fn two_outs(&mut self, op: u32, a: Value, b: Value) -> (Value, Value) {
+        let r = self.two_outs_raw(op, a, b);
         (self.m.extract(r, 0), self.m.extract(r, 1))
     }
     /// Full 64-bit product of two signed i32 → `(hi, lo)`.
@@ -404,6 +407,9 @@ impl Shader {
     pub fn umul_wide(&mut self, a: Value, b: Value) -> (Value, Value) {
         self.two_outs(42, a, b)
     }
+    /// High 32 bits of the full 64-bit signed / unsigned product.
+    pub fn imul_hi(&mut self, a: Value, b: Value) -> Value { let r = self.two_outs_raw(41, a, b); self.m.extract(r, 0) }
+    pub fn umul_hi(&mut self, a: Value, b: Value) -> Value { let r = self.two_outs_raw(42, a, b); self.m.extract(r, 0) }
     /// Unsigned divide → `(quotient, remainder)` (division by zero gives all ones).
     pub fn udiv_rem(&mut self, a: Value, b: Value) -> (Value, Value) {
         self.two_outs(43, a, b)
